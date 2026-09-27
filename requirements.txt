@@ -1,0 +1,11 @@
+# Dependencias de la parte Python del proyecto:
+#   - client/cli.py (OFICIAL, es lo que se entrega): solo necesita "requests"
+#   - controlnode/app.py y datanode/server.py (version antigua en Python,
+#     dejada solo como referencia, ya NO es la que se entrega): necesita Flask
+requests>=2.31
+Flask>=3.0
+
+# Para migrar la transferencia de bloques de sockets TCP a gRPC real desde
+# Python (opcional, ver README.md):
+# grpcio>=1.60
+# grpcio-tools>=1.60

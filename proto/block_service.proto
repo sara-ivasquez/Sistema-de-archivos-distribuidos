@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package dfsha;
+
+// Servicio expuesto por cada DataNode. El Cliente lo usa para escribir y leer
+// bloques directamente (sin pasar por el ControlNode). Tambien se usa entre
+// DataNodes para copiar bloques cuando se necesita re-replicar (Hito 3).
+service BlockService {
+  // Sube un bloque en streaming (permite bloques grandes sin cargar todo en memoria).
+  rpc PutBlock(stream BlockChunk) returns (BlockAck);
+
+  // Descarga un bloque en streaming.
+  rpc GetBlock(BlockRequest) returns (stream BlockChunk);
+
+  // Elimina un bloque local (usado por rm y por el rebalanceo).
+  rpc DeleteBlock(BlockRequest) returns (DeleteAck);
+}
+
+message BlockChunk {
+  string block_id = 1;
+  bytes data = 2;
+}
+
+message BlockAck {
+  bool success = 1;
+  string block_id = 2;
+  string message = 3;
+}
+
+message BlockRequest {
+  string block_id = 1;
+}
+
+message DeleteAck {
+  bool success = 1;
+}

@@ -1,0 +1,13 @@
+# Etapa de compilacion
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY datanode_go/ .
+RUN go build -o /datanode .
+
+# Etapa final (imagen minima, solo el binario)
+FROM alpine:3.20
+COPY --from=build /datanode /datanode
+ENV DN_HOST=0.0.0.0
+ENV DN_STORAGE_DIR=/data
+VOLUME ["/data"]
+ENTRYPOINT ["/datanode"]

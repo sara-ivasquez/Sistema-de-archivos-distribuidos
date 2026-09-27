@@ -1,0 +1,28 @@
+# Go
+controlnode_go/controlnode
+controlnode_go/controlnode.exe
+datanode_go/datanode
+datanode_go/datanode.exe
+
+# Almacenamiento local de prueba de los DataNodes
+storage1/
+storage2/
+storage3/
+datanode_go/storage*/
+
+# Python
+__pycache__/
+*.pyc
+.dfsha_session.json
+
+# Archivos de prueba subidos/descargados
+descargado*.pdf
+descargado*.bin
+prueba.txt
+
+# Docker
+client_files/
+
+# Sistema
+.DS_Store
+Thumbs.db

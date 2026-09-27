@@ -1,0 +1,13 @@
+# Etapa de compilacion
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY controlnode_go/ .
+RUN go build -o /controlnode .
+
+# Etapa final (imagen minima, solo el binario)
+FROM alpine:3.20
+COPY --from=build /controlnode /controlnode
+ENV CN_HOST=0.0.0.0
+ENV CN_PORT=5000
+EXPOSE 5000
+ENTRYPOINT ["/controlnode"]

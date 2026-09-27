@@ -1,0 +1,80 @@
+services:
+  controlnode:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.controlnode-go
+    ports:
+      - "5000:5000"
+    environment:
+      - BLOCK_SIZE=1048576        # 1 MB por bloque (ajustar a 64MB en despliegue real)
+      - REPLICATION_FACTOR=2
+      - HEARTBEAT_TIMEOUT_SECONDS=15
+    networks: [dfsha-net]
+
+  datanode1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.datanode-go
+    environment:
+      - DN_PORT=6001
+      - DN_PUBLIC_HOST=datanode1   # nombre del servicio: resoluble por otros contenedores
+      - CONTROLNODE_URL=http://controlnode:5000
+      - DN_CAPACITY=1073741824
+    ports:
+      - "6001:6001"
+    volumes:
+      - dn1_data:/data
+    depends_on: [controlnode]
+    networks: [dfsha-net]
+
+  datanode2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.datanode-go
+    environment:
+      - DN_PORT=6002
+      - DN_PUBLIC_HOST=datanode2
+      - CONTROLNODE_URL=http://controlnode:5000
+      - DN_CAPACITY=1073741824
+    ports:
+      - "6002:6002"
+    volumes:
+      - dn2_data:/data
+    depends_on: [controlnode]
+    networks: [dfsha-net]
+
+  datanode3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.datanode-go
+    environment:
+      - DN_PORT=6003
+      - DN_PUBLIC_HOST=datanode3
+      - CONTROLNODE_URL=http://controlnode:5000
+      - DN_CAPACITY=1073741824
+    ports:
+      - "6003:6003"
+    volumes:
+      - dn3_data:/data
+    depends_on: [controlnode]
+    networks: [dfsha-net]
+
+  client:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.client
+    environment:
+      - DFSHA_CONTROLNODE_URL=http://controlnode:5000
+    volumes:
+      - ../client_files:/work       # coloca aqui los archivos que quieras subir/bajar
+    depends_on: [controlnode, datanode1, datanode2, datanode3]
+    networks: [dfsha-net]
+    profiles: ["tools"]             # no se levanta con 'docker compose up', solo con 'run'
+
+networks:
+  dfsha-net:
+
+volumes:
+  dn1_data:
+  dn2_data:
+  dn3_data:
