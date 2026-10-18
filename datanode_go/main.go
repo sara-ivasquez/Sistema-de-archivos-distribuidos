@@ -26,6 +26,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -37,27 +43,65 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	opPut    = 1
-	opGet    = 2
-	opDelete = 3
+	opPut       = 1
+	opGet       = 2
+	opDelete    = 3
+	opReplicate = 4 // otro DataNode le pide a este que copie un bloque hacia un tercero
+	opPutRaw    = 5 // usado SOLO entre DataNodes, para recibir esa copia
 
 	statusOK    = 1
 	statusError = 0
 )
 
 var (
-	dnHost              string
-	dnPort              int
-	dnPublicHost        string
-	storageDir          string
-	capacity            int64
-	controlNodeURL      string
-	heartbeatInterval   time.Duration
+	dnHost            string
+	dnPort            int
+	dnPublicHost      string
+	storageDir        string
+	capacity          int64
+	controlNodeURLs   []string
+	activeURLIndex    int
+	activeURLMu       sync.Mutex
+	heartbeatInterval time.Duration
 )
+
+var (
+	caCertFile   string
+	secureClient *http.Client
+)
+
+var encryptionKey []byte
+
+func newSecureHTTPClient(timeout time.Duration) *http.Client {
+	caCert, err := os.ReadFile(caCertFile)
+	if err != nil {
+		log.Printf("[DataNode %d] no se pudo leer el certificado: %v", dnPort, err)
+		return &http.Client{Timeout: timeout}
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+}
+
+func pickControlNodeURL() string {
+	activeURLMu.Lock()
+	defer activeURLMu.Unlock()
+	return controlNodeURLs[activeURLIndex]
+}
+
+func markURLFailed() {
+	activeURLMu.Lock()
+	activeURLIndex = (activeURLIndex + 1) % len(controlNodeURLs)
+	activeURLMu.Unlock()
+}
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -111,6 +155,44 @@ func currentUsage() (int64, int) {
 	return used, count
 }
 
+func deriveKey(passphrase string) []byte {
+	sum := sha256.Sum256([]byte(passphrase))
+	return sum[:]
+}
+
+func encryptBlock(key []byte, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func decryptBlock(key []byte, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("bloque cifrado invalido (muy corto)")
+	}
+	nonce, data := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, data, nil)
+}
+
 // ----------------------------------------------------------------------------
 // Servidor TCP de bloques
 // ----------------------------------------------------------------------------
@@ -151,7 +233,84 @@ func handleConn(conn net.Conn) {
 	blockID := string(blockIDBytes)
 
 	switch opcode {
-	case opPut:
+		case opPut:
+		lenBuf := make([]byte, 8)
+		if err := readFull(conn, lenBuf); err != nil {
+			return
+		}
+		dataLen := binary.BigEndian.Uint64(lenBuf)
+		data := make([]byte, dataLen)
+		if dataLen > 0 {
+			if err := readFull(conn, data); err != nil {
+				return
+			}
+		}
+		encrypted, err := encryptBlock(encryptionKey, data)
+		if err != nil {
+			_ = sendResponse(conn, statusError, []byte(err.Error()))
+			return
+		}
+		if err := os.WriteFile(blockPath(blockID), encrypted, 0644); err != nil {
+			_ = sendResponse(conn, statusError, []byte(err.Error()))
+			return
+		}
+		log.Printf("[DataNode %d] PUT %s (%d bytes, cifrado en reposo)", dnPort, blockID, dataLen)
+		_ = sendResponse(conn, statusOK, []byte("ok"))
+
+		case opGet:
+		encrypted, err := os.ReadFile(blockPath(blockID))
+		if err != nil {
+			_ = sendResponse(conn, statusError, []byte("bloque no encontrado"))
+			return
+		}
+		data, err := decryptBlock(encryptionKey, encrypted)
+		if err != nil {
+			_ = sendResponse(conn, statusError, []byte("no se pudo descifrar el bloque: "+err.Error()))
+			return
+		}
+		log.Printf("[DataNode %d] GET %s (%d bytes)", dnPort, blockID, len(data))
+		_ = sendResponse(conn, statusOK, data)
+
+	case opDelete:
+		_ = os.Remove(blockPath(blockID)) // ignorar si no existe
+		log.Printf("[DataNode %d] DELETE %s", dnPort, blockID)
+		_ = sendResponse(conn, statusOK, []byte("ok"))
+
+	case opReplicate:
+		// El ControlNode nos pide que copiemos un bloque que ya tenemos
+		// hacia otro DataNode (target_host:target_port). Hito 3.
+		hostLenBuf := make([]byte, 2)
+		if err := readFull(conn, hostLenBuf); err != nil {
+			return
+		}
+		hostLen := binary.BigEndian.Uint16(hostLenBuf)
+		hostBytes := make([]byte, hostLen)
+		if err := readFull(conn, hostBytes); err != nil {
+			return
+		}
+		portBuf := make([]byte, 2)
+		if err := readFull(conn, portBuf); err != nil {
+			return
+		}
+		targetPort := int(binary.BigEndian.Uint16(portBuf))
+		targetHost := string(hostBytes)
+
+		data, err := os.ReadFile(blockPath(blockID))
+		if err != nil {
+			_ = sendResponse(conn, statusError, []byte("no tengo ese bloque localmente"))
+			return
+		}
+		if err := putRawRemote(targetHost, targetPort, blockID, data); err != nil {
+			log.Printf("[DataNode %d] REPLICATE %s -> %s:%d fallo: %v", dnPort, blockID, targetHost, targetPort, err)
+			_ = sendResponse(conn, statusError, []byte(err.Error()))
+			return
+		}
+		log.Printf("[DataNode %d] REPLICATE %s -> %s:%d OK", dnPort, blockID, targetHost, targetPort)
+		_ = sendResponse(conn, statusOK, []byte("ok"))
+
+	case opPutRaw:
+		// Recibe una copia de un bloque enviada por OTRO DataNode (no por
+		// el cliente). Se guarda igual que un PUT normal.
 		lenBuf := make([]byte, 8)
 		if err := readFull(conn, lenBuf); err != nil {
 			return
@@ -167,21 +326,7 @@ func handleConn(conn net.Conn) {
 			_ = sendResponse(conn, statusError, []byte(err.Error()))
 			return
 		}
-		log.Printf("[DataNode %d] PUT %s (%d bytes)", dnPort, blockID, dataLen)
-		_ = sendResponse(conn, statusOK, []byte("ok"))
-
-	case opGet:
-		data, err := os.ReadFile(blockPath(blockID))
-		if err != nil {
-			_ = sendResponse(conn, statusError, []byte("bloque no encontrado"))
-			return
-		}
-		log.Printf("[DataNode %d] GET %s (%d bytes)", dnPort, blockID, len(data))
-		_ = sendResponse(conn, statusOK, data)
-
-	case opDelete:
-		_ = os.Remove(blockPath(blockID)) // ignorar si no existe
-		log.Printf("[DataNode %d] DELETE %s", dnPort, blockID)
+		log.Printf("[DataNode %d] PUT_RAW %s (%d bytes, replica P2P recibida)", dnPort, blockID, dataLen)
 		_ = sendResponse(conn, statusOK, []byte("ok"))
 
 	default:
@@ -206,6 +351,47 @@ func serveBlocks() {
 	}
 }
 
+// putRawRemote conecta a otro DataNode y le envia PUT_RAW con los bytes de
+// un bloque (usado por REPLICATE para copiar un bloque hacia otro nodo).
+func putRawRemote(host string, port int, blockID string, data []byte) error {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	idBytes := []byte(blockID)
+	header := make([]byte, 5)
+	header[0] = opPutRaw
+	binary.BigEndian.PutUint32(header[1:], uint32(len(idBytes)))
+	if _, err := conn.Write(header); err != nil {
+		return err
+	}
+	if _, err := conn.Write(idBytes); err != nil {
+		return err
+	}
+	lenBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(lenBuf, uint64(len(data)))
+	if _, err := conn.Write(lenBuf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(data); err != nil {
+		return err
+	}
+
+	respHeader := make([]byte, 5)
+	if err := readFull(conn, respHeader); err != nil {
+		return err
+	}
+	if respHeader[0] != statusOK {
+		payloadLen := binary.BigEndian.Uint32(respHeader[1:])
+		payload := make([]byte, payloadLen)
+		_ = readFull(conn, payload)
+		return fmt.Errorf("PUT_RAW fallo: %s", string(payload))
+	}
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // Registro y heartbeat ante el ControlNode (REST/JSON)
 // ----------------------------------------------------------------------------
@@ -214,37 +400,59 @@ func registerWithControlNode() (string, error) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"host": dnPublicHost, "port": dnPort, "capacity": capacity,
 	})
-	resp, err := http.Post(controlNodeURL+"/datanodes/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", err
+	var lastErr error
+	for i := 0; i < len(controlNodeURLs); i++ {
+		url := pickControlNodeURL()
+		resp, err := secureClient.Post(url+"/datanodes/register", "application/json", bytes.NewReader(body))
+		if err != nil {
+			lastErr = err
+			markURLFailed()
+			continue
+		}
+		if resp.StatusCode != 200 {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("registro fallo (%d): %s", resp.StatusCode, string(respBody))
+			markURLFailed()
+			continue
+		}
+		var out struct {
+			DatanodeID string `json:"datanode_id"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			markURLFailed()
+			continue
+		}
+		log.Printf("[DataNode %d] registrado ante ControlNode (%s) como %s", dnPort, url, out.DatanodeID)
+		return out.DatanodeID, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("registro fallo (%d): %s", resp.StatusCode, string(respBody))
-	}
-	var out struct {
-		DatanodeID string `json:"datanode_id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	log.Printf("[DataNode %d] registrado ante ControlNode como %s", dnPort, out.DatanodeID)
-	return out.DatanodeID, nil
+	return "", lastErr
 }
 
 func heartbeatLoop(datanodeID string) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := secureClient
 	for {
 		used, count := currentUsage()
 		body, _ := json.Marshal(map[string]interface{}{
 			"datanode_id": datanodeID, "used": used, "num_blocks": count,
 		})
-		resp, err := client.Post(controlNodeURL+"/datanodes/heartbeat", "application/json", bytes.NewReader(body))
-		if err != nil {
-			log.Printf("[DataNode %d] heartbeat fallo: %v", dnPort, err)
-		} else {
+		ok := false
+		for i := 0; i < len(controlNodeURLs); i++ {
+			url := pickControlNodeURL()
+			resp, err := client.Post(url+"/datanodes/heartbeat", "application/json", bytes.NewReader(body))
+			if err != nil {
+				markURLFailed()
+				continue
+			}
 			resp.Body.Close()
+			ok = true
+			break
+		}
+		if !ok {
+			log.Printf("[DataNode %d] heartbeat fallo en todos los ControlNodes", dnPort)
 		}
 		time.Sleep(heartbeatInterval)
 	}
@@ -260,8 +468,11 @@ func main() {
 	dnPublicHost = getEnv("DN_PUBLIC_HOST", "127.0.0.1")
 	storageDir = getEnv("DN_STORAGE_DIR", "./storage")
 	capacity = getEnvInt64("DN_CAPACITY", 1*1024*1024*1024)
-	controlNodeURL = getEnv("CONTROLNODE_URL", "http://127.0.0.1:5000")
+	controlNodeURLs = strings.Split(getEnv("CONTROLNODE_URLS", getEnv("CONTROLNODE_URL", "https://127.0.0.1:5000")), ",")
 	heartbeatInterval = time.Duration(getEnvInt("DN_HEARTBEAT_INTERVAL_SECONDS", 5)) * time.Second
+	caCertFile = getEnv("CA_CERT_FILE", "../certs/cert.pem")
+	encryptionKey = deriveKey(getEnv("DN_ENCRYPTION_KEY", "clave-compartida-dfsha-2026"))
+	secureClient = newSecureHTTPClient(10 * time.Second)
 
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		log.Fatalf("[DataNode %d] no se pudo crear storage dir %s: %v", dnPort, storageDir, err)

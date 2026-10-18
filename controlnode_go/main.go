@@ -24,8 +24,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -48,8 +51,32 @@ import (
 var (
 	blockSize         int64
 	replicationFactor int
+	writeQuorum       int
 	heartbeatTimeout  time.Duration
 )
+
+var (
+	role    string // "primary" | "standby"
+	peerURL string
+	roleMu  sync.RWMutex
+)
+
+var (
+	certFile string
+	keyFile  string
+)
+
+func getRole() string {
+	roleMu.RLock()
+	defer roleMu.RUnlock()
+	return role
+}
+
+func setRole(r string) {
+	roleMu.Lock()
+	role = r
+	roleMu.Unlock()
+}
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -91,6 +118,7 @@ type Block struct {
 	BlockID  string    `json:"block_id"`
 	Index    int       `json:"index"`
 	Replicas []Replica `json:"replicas"`
+	Checksum string    `json:"checksum,omitempty"`
 }
 
 type FSEntry struct {
@@ -110,6 +138,93 @@ type DataNodeInfo struct {
 	Used      int64
 	NumBlocks int
 	LastHB    time.Time
+}
+
+type FSEntrySnapshot struct {
+	Type      string   `json:"type"`
+	Children  []string `json:"children,omitempty"`
+	Owner     string   `json:"owner,omitempty"`
+	Size      int64    `json:"size,omitempty"`
+	BlockSize int64    `json:"block_size,omitempty"`
+	Blocks    []Block  `json:"blocks,omitempty"`
+	Status    string   `json:"status,omitempty"`
+}
+
+type DataNodeSnapshot struct {
+	Host      string    `json:"host"`
+	Port      int       `json:"port"`
+	Capacity  int64     `json:"capacity"`
+	Used      int64     `json:"used"`
+	NumBlocks int       `json:"num_blocks"`
+	LastHB    time.Time `json:"last_hb"`
+}
+
+type StateSnapshot struct {
+	Users     map[string]string           `json:"users"`
+	FSTree    map[string]FSEntrySnapshot  `json:"fs_tree"`
+	DataNodes map[string]DataNodeSnapshot `json:"datanodes"`
+}
+
+func exportState() StateSnapshot {
+	mu.Lock()
+	defer mu.Unlock()
+	snap := StateSnapshot{
+		Users:     map[string]string{},
+		FSTree:    map[string]FSEntrySnapshot{},
+		DataNodes: map[string]DataNodeSnapshot{},
+	}
+	for u, h := range users {
+		snap.Users[u] = h
+	}
+	for p, e := range fsTree {
+		children := make([]string, 0, len(e.Children))
+		for c := range e.Children {
+			children = append(children, c)
+		}
+		snap.FSTree[p] = FSEntrySnapshot{
+			Type: e.Type, Children: children, Owner: e.Owner,
+			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
+		}
+	}
+	for id, dn := range datanodes {
+		snap.DataNodes[id] = DataNodeSnapshot{
+			Host: dn.Host, Port: dn.Port, Capacity: dn.Capacity,
+			Used: dn.Used, NumBlocks: dn.NumBlocks, LastHB: dn.LastHB,
+		}
+	}
+	return snap
+}
+
+func importState(snap StateSnapshot) {
+	mu.Lock()
+	defer mu.Unlock()
+	newUsers := map[string]string{}
+	for u, h := range snap.Users {
+		newUsers[u] = h
+	}
+	users = newUsers
+
+	newFSTree := map[string]*FSEntry{}
+	for p, e := range snap.FSTree {
+		children := map[string]bool{}
+		for _, c := range e.Children {
+			children[c] = true
+		}
+		newFSTree[p] = &FSEntry{
+			Type: e.Type, Children: children, Owner: e.Owner,
+			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
+		}
+	}
+	fsTree = newFSTree
+
+	newDatanodes := map[string]*DataNodeInfo{}
+	for id, d := range snap.DataNodes {
+		newDatanodes[id] = &DataNodeInfo{
+			Host: d.Host, Port: d.Port, Capacity: d.Capacity,
+			Used: d.Used, NumBlocks: d.NumBlocks, LastHB: d.LastHB,
+		}
+	}
+	datanodes = newDatanodes
 }
 
 var (
@@ -451,8 +566,12 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 	}
 	parentEntry.Children[p] = true
 
+	effectiveQuorum := writeQuorum
+	if effectiveQuorum > len(blocks[0].Replicas) {
+		effectiveQuorum = len(blocks[0].Replicas)
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"file_id": p, "block_size": blockSize, "blocks": blocks,
+		"file_id": p, "block_size": blockSize, "blocks": blocks, "write_quorum": effectiveQuorum,
 	})
 }
 
@@ -461,7 +580,10 @@ func handlePutComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "no autenticado")
 		return
 	}
-	var body struct{ Path string }
+	var body struct {
+		Path      string
+		Checksums map[string]string
+	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, 400, "body invalido")
 		return
@@ -476,6 +598,11 @@ func handlePutComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	node.Status = "complete"
+	for i := range node.Blocks {
+		if cs, has := body.Checksums[node.Blocks[i].BlockID]; has {
+			node.Blocks[i].Checksum = cs
+		}
+	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -568,6 +695,95 @@ func handleDatanodesStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // ----------------------------------------------------------------------------
+// Re-replicacion automatica (Hito 3, RNF2/RNF3): cada 10s revisa si algun
+// bloque quedo con menos replicas vivas que REPLICATION_FACTOR (porque un
+// DataNode se cayo) y le ordena a un DataNode sano que lo copie hacia otro,
+// directamente (P2P), sin que los bytes pasen por el ControlNode.
+// ----------------------------------------------------------------------------
+
+func newSecureHTTPClient(timeout time.Duration) *http.Client {
+	caCert, err := os.ReadFile(certFile)
+	if err != nil {
+		log.Printf("[ControlNode] no se pudo leer el certificado para verificar al peer: %v", err)
+		return &http.Client{Timeout: timeout}
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+}
+
+func reReplicationLoop() {
+	for {
+		time.Sleep(10 * time.Second)
+
+		type fix struct {
+			path       string
+			blockIndex int
+			blockID    string
+			srcHost    string
+			srcPort    int
+			target     Replica
+		}
+		var fixes []fix
+
+		mu.Lock()
+		alive := aliveDatanodes()
+		for p, entry := range fsTree {
+			if entry.Type != "file" || entry.Status != "complete" {
+				continue
+			}
+			for bi := range entry.Blocks {
+				blk := &entry.Blocks[bi]
+				have := map[string]bool{}
+				var aliveReplicas []Replica
+				for _, rep := range blk.Replicas {
+					have[rep.DataNodeID] = true
+					if _, ok := alive[rep.DataNodeID]; ok {
+						aliveReplicas = append(aliveReplicas, rep)
+					}
+				}
+				if len(aliveReplicas) == 0 || len(aliveReplicas) >= replicationFactor {
+					continue // ya esta completo, o no queda ninguna copia de donde sacarlo
+				}
+				var target *Replica
+				for id, dn := range alive {
+					if !have[id] {
+						target = &Replica{DataNodeID: id, Host: dn.Host, Port: dn.Port}
+						break
+					}
+				}
+				if target == nil {
+					continue // no hay un DataNode libre para recibir la nueva replica
+				}
+				src := aliveReplicas[0]
+				fixes = append(fixes, fix{
+					path: p, blockIndex: bi, blockID: blk.BlockID,
+					srcHost: src.Host, srcPort: src.Port, target: *target,
+				})
+			}
+		}
+		mu.Unlock()
+
+		for _, f := range fixes {
+			log.Printf("[ControlNode] re-replicando bloque %s (%s, indice %d): %s:%d -> %s:%d",
+				f.blockID, f.path, f.blockIndex, f.srcHost, f.srcPort, f.target.Host, f.target.Port)
+			if err := replicateBlockRemote(f.srcHost, f.srcPort, f.blockID, f.target.Host, f.target.Port); err != nil {
+				log.Printf("[ControlNode] re-replicacion de %s fallo: %v", f.blockID, err)
+				continue
+			}
+			mu.Lock()
+			if entry, ok := fsTree[f.path]; ok && f.blockIndex < len(entry.Blocks) {
+				entry.Blocks[f.blockIndex].Replicas = append(entry.Blocks[f.blockIndex].Replicas, f.target)
+			}
+			mu.Unlock()
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Cliente del protocolo de bloques (para que ControlNode pida DeleteBlock a
 // los DataNodes durante "rm"). Mismo framing binario que common/blockproto.py
 // y datanode_go/main.go: 1 byte opcode + 4 bytes len(block_id) + block_id +
@@ -575,7 +791,10 @@ func handleDatanodesStatus(w http.ResponseWriter, r *http.Request) {
 // len(payload) + payload.
 // ----------------------------------------------------------------------------
 
-const opDelete = 3
+const (
+	opDelete    = 3
+	opReplicate = 4
+)
 
 func deleteBlockRemote(host string, port int, blockID string) error {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 5*time.Second)
@@ -609,6 +828,54 @@ func deleteBlockRemote(host string, port int, blockID string) error {
 	return nil
 }
 
+// replicateBlockRemote le ordena al DataNode (host,port) que ya tiene el
+// bloque blockID que lo copie directamente (P2P) hacia (targetHost,targetPort).
+// Esta es la pieza central de la re-replicacion automatica (Hito 3).
+func replicateBlockRemote(host string, port int, blockID, targetHost string, targetPort int) error {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	idBytes := []byte(blockID)
+	hostBytes := []byte(targetHost)
+	buf := make([]byte, 0, 1+4+len(idBytes)+2+len(hostBytes)+2)
+	buf = append(buf, opReplicate)
+	idLen := make([]byte, 4)
+	binary.BigEndian.PutUint32(idLen, uint32(len(idBytes)))
+	buf = append(buf, idLen...)
+	buf = append(buf, idBytes...)
+	hostLen := make([]byte, 2)
+	binary.BigEndian.PutUint16(hostLen, uint16(len(hostBytes)))
+	buf = append(buf, hostLen...)
+	buf = append(buf, hostBytes...)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(targetPort))
+	buf = append(buf, portBytes...)
+
+	if _, err := conn.Write(buf); err != nil {
+		return err
+	}
+
+	respHeader := make([]byte, 5)
+	if _, err := readFull(conn, respHeader); err != nil {
+		return err
+	}
+	status := respHeader[0]
+	payloadLen := binary.BigEndian.Uint32(respHeader[1:])
+	payload := make([]byte, payloadLen)
+	if payloadLen > 0 {
+		if _, err := readFull(conn, payload); err != nil {
+			return err
+		}
+	}
+	if status != 1 {
+		return fmt.Errorf("replicate fallo: %s", string(payload))
+	}
+	return nil
+}
+
 func readFull(conn net.Conn, buf []byte) (int, error) {
 	total := 0
 	for total < len(buf) {
@@ -624,6 +891,82 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 // ----------------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// Alta disponibilidad: roles, replicacion de estado y watchdog
+// ----------------------------------------------------------------------------
+
+func handleInternalHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{"role": getRole()})
+}
+
+func handleInternalSync(w http.ResponseWriter, r *http.Request) {
+	var snap StateSnapshot
+	if err := decodeJSON(r, &snap); err != nil {
+		writeError(w, 400, "snapshot invalido")
+		return
+	}
+	importState(snap)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func replicationLoop() {
+	if peerURL == "" {
+		return
+	}
+	client := newSecureHTTPClient(3 * time.Second)
+	for {
+		time.Sleep(2 * time.Second)
+		if getRole() != "primary" {
+			continue
+		}
+		snap := exportState()
+		body, _ := json.Marshal(snap)
+		resp, err := client.Post(peerURL+"/internal/sync", "application/json", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[ControlNode] no se pudo sincronizar con %s: %v", peerURL, err)
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+
+func watchdogLoop() {
+	if peerURL == "" {
+		return
+	}
+	client := newSecureHTTPClient(2 * time.Second)
+	failures := 0
+	for {
+		time.Sleep(3 * time.Second)
+		if getRole() != "standby" {
+			failures = 0
+			continue
+		}
+		resp, err := client.Get(peerURL + "/internal/health")
+		if err != nil {
+			failures++
+			log.Printf("[ControlNode] primario no responde (%d/3): %v", failures, err)
+		} else {
+			resp.Body.Close()
+			failures = 0
+		}
+		if failures >= 3 {
+			log.Printf("[ControlNode] *** EL PRIMARIO NO RESPONDE: asumiendo rol de PRIMARIO ***")
+			setRole("primary")
+		}
+	}
+}
+
+func requirePrimary(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if getRole() != "primary" {
+			writeError(w, 503, "este ControlNode esta en modo standby, no acepta solicitudes")
+			return
+		}
+		handler(w, r)
+	}
+}
 
 func withMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -641,24 +984,36 @@ func main() {
 	blockSize = getEnvInt64("BLOCK_SIZE", 256*1024)
 	replicationFactor = getEnvInt("REPLICATION_FACTOR", 2)
 	heartbeatTimeout = time.Duration(getEnvInt("HEARTBEAT_TIMEOUT_SECONDS", 15)) * time.Second
+	writeQuorum = getEnvInt("WRITE_QUORUM", replicationFactor/2+1)
+
+	role = getEnv("CN_ROLE", "primary")
+	peerURL = getEnv("CN_PEER_URL", "")
+	certFile = getEnv("CERT_FILE", "../certs/cert.pem")
+	keyFile = getEnv("KEY_FILE", "../certs/key.pem")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/auth/register", withMethod("POST", handleRegister))
-	mux.HandleFunc("/auth/login", withMethod("POST", handleLogin))
-	mux.HandleFunc("/fs/mkdir", withMethod("POST", handleMkdir))
-	mux.HandleFunc("/fs/ls", withMethod("GET", handleLs))
-	mux.HandleFunc("/fs/rmdir", withMethod("DELETE", handleRmdir))
-	mux.HandleFunc("/fs/rm", withMethod("DELETE", handleRm))
-	mux.HandleFunc("/files/put/init", withMethod("POST", handlePutInit))
-	mux.HandleFunc("/files/put/complete", withMethod("POST", handlePutComplete))
-	mux.HandleFunc("/files/get", withMethod("GET", handleGetFile))
-	mux.HandleFunc("/datanodes/register", withMethod("POST", handleDatanodeRegister))
-	mux.HandleFunc("/datanodes/heartbeat", withMethod("POST", handleHeartbeat))
+	mux.HandleFunc("/auth/register", requirePrimary(withMethod("POST", handleRegister)))
+	mux.HandleFunc("/auth/login", requirePrimary(withMethod("POST", handleLogin)))
+	mux.HandleFunc("/fs/mkdir", requirePrimary(withMethod("POST", handleMkdir)))
+	mux.HandleFunc("/fs/ls", requirePrimary(withMethod("GET", handleLs)))
+	mux.HandleFunc("/fs/rmdir", requirePrimary(withMethod("DELETE", handleRmdir)))
+	mux.HandleFunc("/fs/rm", requirePrimary(withMethod("DELETE", handleRm)))
+	mux.HandleFunc("/files/put/init", requirePrimary(withMethod("POST", handlePutInit)))
+	mux.HandleFunc("/files/put/complete", requirePrimary(withMethod("POST", handlePutComplete)))
+	mux.HandleFunc("/files/get", requirePrimary(withMethod("GET", handleGetFile)))
+	mux.HandleFunc("/datanodes/register", requirePrimary(withMethod("POST", handleDatanodeRegister)))
+	mux.HandleFunc("/datanodes/heartbeat", requirePrimary(withMethod("POST", handleHeartbeat)))
 	mux.HandleFunc("/datanodes/status", withMethod("GET", handleDatanodesStatus))
+	mux.HandleFunc("/internal/health", handleInternalHealth)
+	mux.HandleFunc("/internal/sync", withMethod("POST", handleInternalSync))
+
+	go replicationLoop()
+	go watchdogLoop()
+	go reReplicationLoop()
 
 	addr := host + ":" + port
-	log.Printf("[ControlNode] escuchando en %s (block_size=%d, replication=%d)", addr, blockSize, replicationFactor)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	log.Printf("[ControlNode] escuchando en %s (rol=%s, block_size=%d, replication=%d, TLS=on)", addr, role, blockSize, replicationFactor)
+	if err := http.ListenAndServeTLS(addr, certFile, keyFile, mux); err != nil {
 		log.Fatal(err)
 	}
 }
