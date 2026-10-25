@@ -26,3 +26,10 @@ client_files/
 # Sistema
 .DS_Store
 Thumbs.db
+# Certificados y secretos (se generan en cada despliegue, NUNCA al repo)
+certs/
+docker/.env
+docker/aws/.env
+
+# Estado persistido del ControlNode en ejecucion local
+controlnode_go/controlnode_state.json*

@@ -1,32 +1,40 @@
-// ControlNode de DFSha (Hito 2), reescrito en Go por requisito del profesor
-// (servicio distribuido en Java o Go; el cliente se mantiene en Python).
+// ControlNode de DFSha — servidor de metadatos (Go, solo libreria estandar).
 //
-// Usa unicamente la libreria estandar de Go (net/http, encoding/json, etc.)
-// para que compile con "go build" sin necesitar "go get" ni internet.
-//
-// Responsabilidades (identicas a la version en Python, ver controlnode/app.py
-// y el Entregable 1 - RF1, RF4, RF5, RNF4):
-//   - Autenticacion basica (RF4).
-//   - Gestion del arbol de directorios / archivos: mkdir, ls, rmdir, rm (RF1).
+// Responsabilidades:
+//   - Autenticacion de usuarios y sesiones con expiracion (RF4).
+//   - Arbol de directorios/archivos y control de acceso por dueno (RF1).
 //   - Registro y heartbeat de DataNodes.
 //   - Algoritmo de particionamiento y colocacion de bloques (RNF4).
 //   - El ControlNode nunca mueve los bytes del archivo (RF2): solo indica
-//     donde estan/deben ir; para "rm" les pide a los DataNodes que borren
-//     sus replicas, usando el mismo protocolo de bloques que usa el cliente.
+//     donde estan/deben ir; para "rm" y la re-replicacion les da ordenes a
+//     los DataNodes por la API de bloques.
+//
+// Hito 3: HA primario/standby con epocas (sin split-brain), replicacion de
+// estado y sesiones, re-replicacion automatica, control de acceso por
+// usuario, TLS en todas las comunicaciones y secreto compartido entre nodos.
 //
 // Ejecucion:
-//   go run main.go
+//
+//	go run main.go
+//
 // Variables de entorno:
-//   CN_HOST (default 0.0.0.0), CN_PORT (default 5000)
-//   BLOCK_SIZE (default 262144 = 256 KB)
-//   REPLICATION_FACTOR (default 2)
-//   HEARTBEAT_TIMEOUT_SECONDS (default 15)
+//
+//	CN_HOST (default 0.0.0.0), CN_PORT (default 5000)
+//	BLOCK_SIZE (default 262144 = 256 KB)
+//	REPLICATION_FACTOR (default 2), WRITE_QUORUM (default N/2+1)
+//	HEARTBEAT_TIMEOUT_SECONDS (default 15)
+//	CN_ROLE (primary|standby), CN_PEER_URL (https://otro-controlnode:puerto)
+//	CERT_FILE, KEY_FILE (default ../certs/cert.pem y ../certs/key.pem)
+//	CLUSTER_SECRET (secreto compartido con DataNodes y el otro ControlNode)
+//	TOKEN_TTL_HOURS (default 8), UPLOAD_TIMEOUT_MINUTES (default 30)
+//	CN_STATE_FILE (default ./controlnode_state.json)
 package main
 
 import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -40,7 +48,9 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,18 +63,29 @@ var (
 	replicationFactor int
 	writeQuorum       int
 	heartbeatTimeout  time.Duration
+	uploadTimeout     time.Duration
+	stateFile         string
 )
 
 var (
-	role    string // "primary" | "standby"
-	peerURL string
-	roleMu  sync.RWMutex
+	role           string // "primary" | "standby"
+	configuredRole string // rol pedido por CN_ROLE (solo se usa para desempatar)
+	epoch          uint64 // "epoca" del primario; sube en cada promocion (evita split-brain)
+	peerURL        string
+	roleMu         sync.RWMutex
 )
 
 var (
-	certFile string
-	keyFile  string
+	certFile      string
+	keyFile       string
+	clusterSecret string
+	tokenTTL      time.Duration
+	blockTLS      *tls.Config // config TLS para hablar el protocolo de bloques con los DataNodes
 )
+
+// Header que deben enviar los nodos internos (DataNodes y el otro
+// ControlNode) para que el ControlNode acepte sus solicitudes.
+const clusterSecretHeader = "X-DFSha-Cluster-Secret"
 
 func getRole() string {
 	roleMu.RLock()
@@ -72,9 +93,33 @@ func getRole() string {
 	return role
 }
 
+func getEpoch() uint64 {
+	roleMu.RLock()
+	defer roleMu.RUnlock()
+	return epoch
+}
+
 func setRole(r string) {
 	roleMu.Lock()
 	role = r
+	roleMu.Unlock()
+}
+
+// promote convierte este nodo en primario con una epoca nueva, mayor que
+// cualquiera que haya visto. Asi, si el primario viejo revive, puede saber
+// que ya no manda.
+func promote() {
+	roleMu.Lock()
+	role = "primary"
+	epoch++
+	roleMu.Unlock()
+}
+
+func setEpochIfHigher(e uint64) {
+	roleMu.Lock()
+	if e > epoch {
+		epoch = e
+	}
 	roleMu.Unlock()
 }
 
@@ -104,8 +149,8 @@ func getEnvInt(key string, def int) int {
 }
 
 // ----------------------------------------------------------------------------
-// Modelos y estado en memoria (equivalente a USERS/TOKENS/DATANODES/FS en la
-// version Python; protegido por un unico mutex, igual que el LOCK de Flask)
+// Modelos y estado en memoria (protegido por un unico mutex; se replica al
+// standby y se persiste en disco, ver mas abajo)
 // ----------------------------------------------------------------------------
 
 type Replica struct {
@@ -129,6 +174,7 @@ type FSEntry struct {
 	BlockSize int64           `json:"block_size,omitempty"`
 	Blocks    []Block         `json:"blocks,omitempty"`
 	Status    string          `json:"status,omitempty"`
+	CreatedAt time.Time       `json:"-"`
 }
 
 type DataNodeInfo struct {
@@ -141,13 +187,14 @@ type DataNodeInfo struct {
 }
 
 type FSEntrySnapshot struct {
-	Type      string   `json:"type"`
-	Children  []string `json:"children,omitempty"`
-	Owner     string   `json:"owner,omitempty"`
-	Size      int64    `json:"size,omitempty"`
-	BlockSize int64    `json:"block_size,omitempty"`
-	Blocks    []Block  `json:"blocks,omitempty"`
-	Status    string   `json:"status,omitempty"`
+	Type      string    `json:"type"`
+	Children  []string  `json:"children,omitempty"`
+	Owner     string    `json:"owner,omitempty"`
+	Size      int64     `json:"size,omitempty"`
+	BlockSize int64     `json:"block_size,omitempty"`
+	Blocks    []Block   `json:"blocks,omitempty"`
+	Status    string    `json:"status,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type DataNodeSnapshot struct {
@@ -159,8 +206,17 @@ type DataNodeSnapshot struct {
 	LastHB    time.Time `json:"last_hb"`
 }
 
+// Sesion de un usuario. Se replica al standby para que, tras un failover,
+// el cliente no tenga que volver a hacer login (transparencia).
+type TokenInfo struct {
+	Username string    `json:"username"`
+	Expires  time.Time `json:"expires"`
+}
+
 type StateSnapshot struct {
+	Epoch     uint64                      `json:"epoch"`
 	Users     map[string]string           `json:"users"`
+	Tokens    map[string]TokenInfo        `json:"tokens"`
 	FSTree    map[string]FSEntrySnapshot  `json:"fs_tree"`
 	DataNodes map[string]DataNodeSnapshot `json:"datanodes"`
 }
@@ -169,12 +225,17 @@ func exportState() StateSnapshot {
 	mu.Lock()
 	defer mu.Unlock()
 	snap := StateSnapshot{
+		Epoch:     getEpoch(),
 		Users:     map[string]string{},
+		Tokens:    map[string]TokenInfo{},
 		FSTree:    map[string]FSEntrySnapshot{},
 		DataNodes: map[string]DataNodeSnapshot{},
 	}
 	for u, h := range users {
 		snap.Users[u] = h
+	}
+	for t, info := range tokens {
+		snap.Tokens[t] = info
 	}
 	for p, e := range fsTree {
 		children := make([]string, 0, len(e.Children))
@@ -184,6 +245,7 @@ func exportState() StateSnapshot {
 		snap.FSTree[p] = FSEntrySnapshot{
 			Type: e.Type, Children: children, Owner: e.Owner,
 			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
+			CreatedAt: e.CreatedAt,
 		}
 	}
 	for id, dn := range datanodes {
@@ -204,6 +266,12 @@ func importState(snap StateSnapshot) {
 	}
 	users = newUsers
 
+	newTokens := map[string]TokenInfo{}
+	for t, info := range snap.Tokens {
+		newTokens[t] = info
+	}
+	tokens = newTokens
+
 	newFSTree := map[string]*FSEntry{}
 	for p, e := range snap.FSTree {
 		children := map[string]bool{}
@@ -213,6 +281,7 @@ func importState(snap StateSnapshot) {
 		newFSTree[p] = &FSEntry{
 			Type: e.Type, Children: children, Owner: e.Owner,
 			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
+			CreatedAt: e.CreatedAt,
 		}
 	}
 	fsTree = newFSTree
@@ -229,8 +298,8 @@ func importState(snap StateSnapshot) {
 
 var (
 	mu        sync.Mutex
-	users     = map[string]string{} // username -> sha256 hex del password
-	tokens    = map[string]string{} // token -> username
+	users     = map[string]string{}    // username -> hash con sal del password
+	tokens    = map[string]TokenInfo{} // token -> sesion
 	datanodes = map[string]*DataNodeInfo{}
 	fsTree    = map[string]*FSEntry{
 		"/": {Type: "dir", Children: map[string]bool{}},
@@ -240,6 +309,29 @@ var (
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// Contrasenas: sal aleatoria + SHA-256 iterado (formato "s1$<sal>$<hash>").
+// Asi dos usuarios con la misma clave no tienen el mismo hash y un ataque
+// de diccionario cuesta passwordIterations veces mas.
+const passwordIterations = 100000
+
+func hashPassword(password, salt string) string {
+	sum := sha256.Sum256([]byte(salt + password))
+	for i := 1; i < passwordIterations; i++ {
+		sum = sha256.Sum256(append([]byte(salt), sum[:]...))
+	}
+	return "s1$" + salt + "$" + hex.EncodeToString(sum[:])
+}
+
+func checkPassword(stored, password string) bool {
+	var expected string
+	if parts := strings.SplitN(stored, "$", 3); len(parts) == 3 && parts[0] == "s1" {
+		expected = hashPassword(password, parts[1])
+	} else {
+		expected = sha256Hex(password) // formato del Hito 2 (sin sal)
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(expected)) == 1
 }
 
 func randHex(nBytes int) string {
@@ -285,8 +377,37 @@ func requireAuth(r *http.Request) (string, bool) {
 	token := authz[len(prefix):]
 	mu.Lock()
 	defer mu.Unlock()
-	username, ok := tokens[token]
-	return username, ok
+	info, ok := tokens[token]
+	if !ok {
+		return "", false
+	}
+	if time.Now().After(info.Expires) {
+		delete(tokens, token)
+		return "", false
+	}
+	return info.Username, true
+}
+
+// requireClusterSecret protege los endpoints que solo deben usar otros
+// nodos del cluster (registro/heartbeat de DataNodes y sincronizacion entre
+// ControlNodes). Sin esto, cualquiera podria registrar un DataNode falso o
+// reemplazar todo el estado del ControlNode.
+func requireClusterSecret(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get(clusterSecretHeader)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(clusterSecret)) != 1 {
+			writeError(w, 403, "nodo no autorizado")
+			return
+		}
+		handler(w, r)
+	}
+}
+
+// canAccess: un usuario solo puede operar sobre lo que le pertenece. La
+// raiz "/" (owner vacio) es compartida: ahi cualquiera puede crear, pero
+// solo ve y toca sus propias entradas.
+func canAccess(entry *FSEntry, user string) bool {
+	return entry.Owner == "" || entry.Owner == user
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {
@@ -295,8 +416,7 @@ func decodeJSON(r *http.Request, v interface{}) error {
 }
 
 // ----------------------------------------------------------------------------
-// Algoritmo de particionamiento y colocacion (RNF4) — equivalente a
-// _pick_replicas() en controlnode/app.py
+// Algoritmo de particionamiento y colocacion (RNF4)
 // ----------------------------------------------------------------------------
 
 func aliveDatanodes() map[string]*DataNodeInfo {
@@ -359,13 +479,17 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "username y password son requeridos")
 		return
 	}
+	if len(body.Username) > 64 || len(body.Password) < 4 {
+		writeError(w, 400, "usuario de maximo 64 caracteres y password de minimo 4")
+		return
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if _, exists := users[body.Username]; exists {
 		writeError(w, 409, "el usuario ya existe")
 		return
 	}
-	users[body.Username] = sha256Hex(body.Password)
+	users[body.Username] = hashPassword(body.Password, randHex(16))
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -376,13 +500,16 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if hash, ok := users[body.Username]; !ok || hash != sha256Hex(body.Password) {
+	stored, ok := users[body.Username]
+	mu.Unlock()
+	if !ok || !checkPassword(stored, body.Password) {
 		writeError(w, 401, "credenciales invalidas")
 		return
 	}
-	token := randHex(16)
-	tokens[token] = body.Username
+	mu.Lock()
+	defer mu.Unlock()
+	token := randHex(32)
+	tokens[token] = TokenInfo{Username: body.Username, Expires: time.Now().Add(tokenTTL)}
 	writeJSON(w, 200, map[string]string{"token": token})
 }
 
@@ -411,6 +538,10 @@ func handleMkdir(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("el directorio padre %s no existe", parent))
 		return
 	}
+	if !canAccess(parentEntry, owner) {
+		writeError(w, 403, "no tienes permiso sobre "+parent)
+		return
+	}
 	if _, exists := fsTree[p]; exists {
 		writeError(w, 409, "la ruta ya existe")
 		return
@@ -421,7 +552,8 @@ func handleMkdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLs(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAuth(r); !ok {
+	user, ok := requireAuth(r)
+	if !ok {
 		writeError(w, 401, "no autenticado")
 		return
 	}
@@ -432,6 +564,10 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 	node, exists := fsTree[p]
 	if !exists || node.Type != "dir" {
 		writeError(w, 404, "directorio no encontrado")
+		return
+	}
+	if !canAccess(node, user) {
+		writeError(w, 403, "no tienes permiso sobre "+p)
 		return
 	}
 	names := make([]string, 0, len(node.Children))
@@ -443,12 +579,15 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
 		Name   string `json:"name"`
 		Type   string `json:"type"`
-		Size   int64  `json:"size,omitempty"`
+		Size   int64  `json:"size"` // sin omitempty: un archivo de 0 bytes tambien trae "size"
 		Status string `json:"status,omitempty"`
 	}
 	entries := make([]entry, 0, len(names))
 	for _, child := range names {
 		c := fsTree[child]
+		if c.Owner != user {
+			continue // en la raiz compartida solo se ven las entradas propias
+		}
 		e := entry{Name: path.Base(child), Type: c.Type}
 		if c.Type == "file" {
 			e.Size = c.Size
@@ -460,17 +599,26 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRmdir(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAuth(r); !ok {
+	user, ok := requireAuth(r)
+	if !ok {
 		writeError(w, 401, "no autenticado")
 		return
 	}
 	p := normPath(r.URL.Query().Get("path"))
+	if p == "/" {
+		writeError(w, 400, "no se puede eliminar el directorio raiz")
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	node, exists := fsTree[p]
 	if !exists || node.Type != "dir" {
 		writeError(w, 404, "directorio no encontrado")
+		return
+	}
+	if node.Owner != user {
+		writeError(w, 403, "no tienes permiso sobre "+p)
 		return
 	}
 	if len(node.Children) > 0 {
@@ -484,7 +632,8 @@ func handleRmdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRm(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAuth(r); !ok {
+	user, ok := requireAuth(r)
+	if !ok {
 		writeError(w, 401, "no autenticado")
 		return
 	}
@@ -497,20 +646,36 @@ func handleRm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "archivo no encontrado")
 		return
 	}
+	if node.Owner != user {
+		mu.Unlock()
+		writeError(w, 403, "no tienes permiso sobre "+p)
+		return
+	}
 	blocks := node.Blocks
 	parent := normPath(path.Dir(p))
 	delete(fsTree[parent].Children, p)
 	delete(fsTree, p)
 	mu.Unlock()
 
-	// Fuera del lock: avisar a los DataNodes (best-effort, mismo protocolo
-	// binario que usa el cliente en common/blockproto.py)
+	// Fuera del lock: avisar a los DataNodes (best-effort, API de bloques)
+	deleteBlocksRemote(blocks)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// deleteBlocksRemote pide a cada replica que borre su copia, en paralelo
+// para que un DataNode caido (timeout) no frene al resto.
+func deleteBlocksRemote(blocks []Block) {
+	var wg sync.WaitGroup
 	for _, b := range blocks {
 		for _, rep := range b.Replicas {
-			_ = deleteBlockRemote(rep.Host, rep.Port, b.BlockID)
+			wg.Add(1)
+			go func(host string, port int, id string) {
+				defer wg.Done()
+				_ = deleteBlockRemote(host, port, id)
+			}(rep.Host, rep.Port, b.BlockID)
 		}
 	}
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	wg.Wait()
 }
 
 // ----------------------------------------------------------------------------
@@ -533,6 +698,19 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 	}
 	p := normPath(body.Path)
 	parent := normPath(path.Dir(p))
+	if p == "/" || body.Size < 0 {
+		writeError(w, 400, "ruta o tamano invalido")
+		return
+	}
+
+	// Bloques de una version anterior del archivo (si se sobrescribe). Se
+	// borran de los DataNodes fuera del lock, al final.
+	var oldBlocks []Block
+	defer func() {
+		if len(oldBlocks) > 0 {
+			go deleteBlocksRemote(oldBlocks)
+		}
+	}()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -540,6 +718,20 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 	if !exists || parentEntry.Type != "dir" {
 		writeError(w, 404, fmt.Sprintf("el directorio %s no existe", parent))
 		return
+	}
+	if !canAccess(parentEntry, owner) {
+		writeError(w, 403, "no tienes permiso sobre "+parent)
+		return
+	}
+	if existing, exists := fsTree[p]; exists {
+		if existing.Type == "dir" {
+			writeError(w, 409, "ya existe un directorio con ese nombre")
+			return
+		}
+		if existing.Owner != owner {
+			writeError(w, 403, "no tienes permiso sobre "+p)
+			return
+		}
 	}
 	if len(aliveDatanodes()) == 0 {
 		writeError(w, 503, "no hay DataNodes disponibles")
@@ -560,9 +752,12 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 		blocks = append(blocks, Block{BlockID: randHex(16), Index: i, Replicas: replicas})
 	}
 
+	if existing, exists := fsTree[p]; exists {
+		oldBlocks = existing.Blocks // sobrescritura: la version vieja se borra
+	}
 	fsTree[p] = &FSEntry{
 		Type: "file", Size: body.Size, BlockSize: blockSize,
-		Blocks: blocks, Status: "uploading", Owner: owner,
+		Blocks: blocks, Status: "uploading", Owner: owner, CreatedAt: time.Now(),
 	}
 	parentEntry.Children[p] = true
 
@@ -576,7 +771,8 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePutComplete(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAuth(r); !ok {
+	user, ok := requireAuth(r)
+	if !ok {
 		writeError(w, 401, "no autenticado")
 		return
 	}
@@ -597,6 +793,10 @@ func handlePutComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "archivo no encontrado")
 		return
 	}
+	if node.Owner != user {
+		writeError(w, 403, "no tienes permiso sobre "+p)
+		return
+	}
 	node.Status = "complete"
 	for i := range node.Blocks {
 		if cs, has := body.Checksums[node.Blocks[i].BlockID]; has {
@@ -607,7 +807,8 @@ func handlePutComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetFile(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAuth(r); !ok {
+	user, ok := requireAuth(r)
+	if !ok {
 		writeError(w, 401, "no autenticado")
 		return
 	}
@@ -620,12 +821,30 @@ func handleGetFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "archivo no encontrado")
 		return
 	}
+	if node.Owner != user {
+		writeError(w, 403, "no tienes permiso sobre "+p)
+		return
+	}
 	if node.Status != "complete" {
 		writeError(w, 409, "el archivo aun no termino de subirse")
 		return
 	}
+	// Se devuelven las replicas vivas primero, para que el cliente no pierda
+	// tiempo (timeouts) intentando leer de un DataNode caido.
+	alive := aliveDatanodes()
+	blocks := make([]Block, len(node.Blocks))
+	for i, b := range node.Blocks {
+		reps := append([]Replica{}, b.Replicas...)
+		sort.SliceStable(reps, func(x, y int) bool {
+			_, ax := alive[reps[x].DataNodeID]
+			_, ay := alive[reps[y].DataNodeID]
+			return ax && !ay
+		})
+		b.Replicas = reps
+		blocks[i] = b
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"size": node.Size, "block_size": node.BlockSize, "blocks": node.Blocks,
+		"size": node.Size, "block_size": node.BlockSize, "blocks": blocks,
 	})
 }
 
@@ -635,18 +854,25 @@ func handleGetFile(w http.ResponseWriter, r *http.Request) {
 
 func handleDatanodeRegister(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Host     string
-		Port     int
-		Capacity int64
+		Host       string
+		Port       int
+		Capacity   int64
+		DatanodeID string `json:"datanode_id"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
+	if err := decodeJSON(r, &body); err != nil || body.Host == "" || body.Port <= 0 {
 		writeError(w, 400, "body invalido")
 		return
 	}
 	if body.Capacity == 0 {
 		body.Capacity = 10 * 1024 * 1024 * 1024
 	}
-	id := "dn-" + randHex(4)
+	// Si el DataNode ya tenia un ID (reinicio, o re-registro tras un
+	// failover del ControlNode) lo conservamos: asi sus bloques siguen
+	// contando como replicas validas en los metadatos.
+	id := body.DatanodeID
+	if len(id) < 4 || len(id) > 64 || id[:3] != "dn-" {
+		id = "dn-" + randHex(4)
+	}
 
 	mu.Lock()
 	datanodes[id] = &DataNodeInfo{Host: body.Host, Port: body.Port, Capacity: body.Capacity, LastHB: time.Now()}
@@ -701,23 +927,45 @@ func handleDatanodesStatus(w http.ResponseWriter, r *http.Request) {
 // directamente (P2P), sin que los bytes pasen por el ControlNode.
 // ----------------------------------------------------------------------------
 
-func newSecureHTTPClient(timeout time.Duration) *http.Client {
+// loadCAPool carga el certificado autofirmado del cluster como unica CA de
+// confianza. Si falla, el ControlNode no arranca: preferimos caer a hablar
+// con otros nodos sin verificar quienes son.
+func loadCAPool() *x509.CertPool {
 	caCert, err := os.ReadFile(certFile)
 	if err != nil {
-		log.Printf("[ControlNode] no se pudo leer el certificado para verificar al peer: %v", err)
-		return &http.Client{Timeout: timeout}
+		log.Fatalf("[ControlNode] no se pudo leer el certificado %s: %v", certFile, err)
 	}
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caCert)
+	if !pool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("[ControlNode] %s no contiene un certificado PEM valido", certFile)
+	}
+	return pool
+}
+
+func newSecureHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: loadCAPool(), MinVersion: tls.VersionTLS12}},
 	}
+}
+
+// postInternal envia un POST a otro nodo del cluster con el secreto compartido.
+func postInternal(client *http.Client, url string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(clusterSecretHeader, clusterSecret)
+	return client.Do(req)
 }
 
 func reReplicationLoop() {
 	for {
 		time.Sleep(10 * time.Second)
+		if getRole() != "primary" {
+			continue // el standby solo observa; si actuara, ambos copiarian lo mismo
+		}
 
 		type fix struct {
 			path       string
@@ -728,8 +976,28 @@ func reReplicationLoop() {
 			target     Replica
 		}
 		var fixes []fix
+		var abandoned []Block
 
 		mu.Lock()
+		// Subidas abandonadas: un archivo que lleva mucho en "uploading" (el
+		// cliente aborto o se cayo) se elimina junto con sus bloques.
+		for p, entry := range fsTree {
+			if entry.Type != "file" || entry.Status != "uploading" {
+				continue
+			}
+			if entry.CreatedAt.IsZero() {
+				entry.CreatedAt = time.Now()
+				continue
+			}
+			if time.Since(entry.CreatedAt) > uploadTimeout {
+				log.Printf("[ControlNode] eliminando subida abandonada %s", p)
+				abandoned = append(abandoned, entry.Blocks...)
+				if parent, ok := fsTree[normPath(path.Dir(p))]; ok {
+					delete(parent.Children, p)
+				}
+				delete(fsTree, p)
+			}
+		}
 		alive := aliveDatanodes()
 		for p, entry := range fsTree {
 			if entry.Type != "file" || entry.Status != "complete" {
@@ -767,6 +1035,9 @@ func reReplicationLoop() {
 		}
 		mu.Unlock()
 
+		if len(abandoned) > 0 {
+			deleteBlocksRemote(abandoned)
+		}
 		for _, f := range fixes {
 			log.Printf("[ControlNode] re-replicando bloque %s (%s, indice %d): %s:%d -> %s:%d",
 				f.blockID, f.path, f.blockIndex, f.srcHost, f.srcPort, f.target.Host, f.target.Port)
@@ -784,11 +1055,8 @@ func reReplicationLoop() {
 }
 
 // ----------------------------------------------------------------------------
-// Cliente del protocolo de bloques (para que ControlNode pida DeleteBlock a
-// los DataNodes durante "rm"). Mismo framing binario que common/blockproto.py
-// y datanode_go/main.go: 1 byte opcode + 4 bytes len(block_id) + block_id +
-// [solo PUT] 8 bytes len(data) + data. Respuesta: 1 byte status + 4 bytes
-// len(payload) + payload.
+// Cliente de la API de bloques (TCP + TLS) para DELETE y REPLICATE. El
+// framing esta documentado en datanode_go/main.go y common/blockproto.py.
 // ----------------------------------------------------------------------------
 
 const (
@@ -796,21 +1064,46 @@ const (
 	opReplicate = 4
 )
 
+// dialBlock abre una conexion TLS hacia un DataNode, verificando su
+// certificado contra la CA del cluster.
+func dialBlock(host string, port int, timeout time.Duration) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	cfg := blockTLS.Clone()
+	cfg.ServerName = host
+	conn, err := tls.DialWithDialer(dialer, "tcp", fmt.Sprintf("%s:%d", host, port), cfg)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	return conn, nil
+}
+
+// blockHeader arma el inicio de un request del protocolo de bloques. Las
+// operaciones administrativas (DELETE, REPLICATE, PUT_RAW) llevan ademas el
+// secreto del cluster: solo nodos internos pueden borrar o copiar bloques.
+func blockHeader(opcode byte, blockID string, withSecret bool) []byte {
+	idBytes := []byte(blockID)
+	buf := make([]byte, 5, 5+len(idBytes)+2+len(clusterSecret))
+	buf[0] = opcode
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(idBytes)))
+	buf = append(buf, idBytes...)
+	if withSecret {
+		secretLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(secretLen, uint16(len(clusterSecret)))
+		buf = append(buf, secretLen...)
+		buf = append(buf, []byte(clusterSecret)...)
+	}
+	return buf
+}
+
 func deleteBlockRemote(host string, port int, blockID string) error {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 5*time.Second)
+	conn, err := dialBlock(host, port, 5*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	idBytes := []byte(blockID)
-	header := make([]byte, 5)
-	header[0] = opDelete
-	binary.BigEndian.PutUint32(header[1:], uint32(len(idBytes)))
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	if _, err := conn.Write(idBytes); err != nil {
+	if _, err := conn.Write(blockHeader(opDelete, blockID, true)); err != nil {
 		return err
 	}
 
@@ -832,20 +1125,14 @@ func deleteBlockRemote(host string, port int, blockID string) error {
 // bloque blockID que lo copie directamente (P2P) hacia (targetHost,targetPort).
 // Esta es la pieza central de la re-replicacion automatica (Hito 3).
 func replicateBlockRemote(host string, port int, blockID, targetHost string, targetPort int) error {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 5*time.Second)
+	conn, err := dialBlock(host, port, 5*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	idBytes := []byte(blockID)
 	hostBytes := []byte(targetHost)
-	buf := make([]byte, 0, 1+4+len(idBytes)+2+len(hostBytes)+2)
-	buf = append(buf, opReplicate)
-	idLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(idLen, uint32(len(idBytes)))
-	buf = append(buf, idLen...)
-	buf = append(buf, idBytes...)
+	buf := blockHeader(opReplicate, blockID, true)
 	hostLen := make([]byte, 2)
 	binary.BigEndian.PutUint16(hostLen, uint16(len(hostBytes)))
 	buf = append(buf, hostLen...)
@@ -889,15 +1176,26 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 }
 
 // ----------------------------------------------------------------------------
-// main
+// Alta disponibilidad: roles, replicacion de estado y watchdog
+//
+// Esquema primario/standby con "epocas" para evitar split-brain:
+//   - Cada vez que un nodo se promueve a primario, sube su epoca.
+//   - El standby solo acepta snapshots de una epoca >= a la suya, y un nodo
+//     que es primario NUNCA acepta un snapshot (antes, un primario viejo que
+//     revivia con estado vacio podia borrar todo el estado del nuevo).
+//   - Al arrancar, un nodo le pregunta al peer su rol: si el peer ya es
+//     primario, arranca como standby aunque CN_ROLE diga "primary".
+//   - Si aun asi quedan dos primarios (p. ej. una particion de red), el de
+//     epoca menor detecta el rechazo del otro y se degrada a standby.
 // ----------------------------------------------------------------------------
 
-// ----------------------------------------------------------------------------
-// Alta disponibilidad: roles, replicacion de estado y watchdog
-// ----------------------------------------------------------------------------
+type peerStatus struct {
+	Role  string `json:"role"`
+	Epoch uint64 `json:"epoch"`
+}
 
 func handleInternalHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]string{"role": getRole()})
+	writeJSON(w, 200, peerStatus{Role: getRole(), Epoch: getEpoch()})
 }
 
 func handleInternalSync(w http.ResponseWriter, r *http.Request) {
@@ -906,29 +1204,122 @@ func handleInternalSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "snapshot invalido")
 		return
 	}
+	myRole, myEpoch := getRole(), getEpoch()
+	if myRole == "primary" || snap.Epoch < myEpoch {
+		log.Printf("[ControlNode] snapshot rechazado (soy %s epoca %d, llego epoca %d)", myRole, myEpoch, snap.Epoch)
+		writeJSON(w, 409, peerStatus{Role: myRole, Epoch: myEpoch})
+		return
+	}
 	importState(snap)
+	setEpochIfHigher(snap.Epoch)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-func replicationLoop() {
-	if peerURL == "" {
+// shouldStepDown decide si este primario debe degradarse al ver que el peer
+// tambien es primario.
+func shouldStepDown(peer peerStatus) bool {
+	if peer.Role != "primary" {
+		return false
+	}
+	mine := getEpoch()
+	if peer.Epoch != mine {
+		return peer.Epoch > mine
+	}
+	// Empate de epocas: cede el que fue configurado como standby.
+	return configuredRole == "standby"
+}
+
+var (
+	syncClient   *http.Client
+	syncMu       sync.Mutex
+	peerDownLogs int
+	peerDown     atomic.Bool // el ultimo intento de sincronizar fallo
+)
+
+// pushToPeer envia el estado completo al standby. Se serializa con syncMu y
+// cada envio exporta el estado mas reciente, asi que el orden no importa.
+func pushToPeer() {
+	if peerURL == "" || getRole() != "primary" {
 		return
 	}
-	client := newSecureHTTPClient(3 * time.Second)
+	syncMu.Lock()
+	defer syncMu.Unlock()
+	body, _ := json.Marshal(exportState())
+	resp, err := postInternal(syncClient, peerURL+"/internal/sync", body)
+	peerDown.Store(err != nil)
+	if err != nil {
+		if peerDownLogs%15 == 0 { // no llenar el log mientras el peer esta caido
+			log.Printf("[ControlNode] no se pudo sincronizar con %s: %v", peerURL, err)
+		}
+		peerDownLogs++
+		return
+	}
+	defer resp.Body.Close()
+	peerDownLogs = 0
+	if resp.StatusCode == 409 {
+		var peer peerStatus
+		_ = json.NewDecoder(resp.Body).Decode(&peer)
+		if shouldStepDown(peer) {
+			log.Printf("[ControlNode] *** el peer es primario con epoca %d (la mia es %d): paso a STANDBY ***", peer.Epoch, getEpoch())
+			setRole("standby")
+			setEpochIfHigher(peer.Epoch)
+		}
+	} else if resp.StatusCode != 200 {
+		log.Printf("[ControlNode] sincronizacion con %s respondio %d", peerURL, resp.StatusCode)
+	}
+}
+
+// replicationLoop sincroniza periodicamente (cubre cambios que no pasan por
+// un handler, como heartbeats o la re-replicacion).
+func replicationLoop() {
 	for {
 		time.Sleep(2 * time.Second)
-		if getRole() != "primary" {
-			continue
-		}
-		snap := exportState()
-		body, _ := json.Marshal(snap)
-		resp, err := client.Post(peerURL+"/internal/sync", "application/json", bytes.NewReader(body))
-		if err != nil {
-			log.Printf("[ControlNode] no se pudo sincronizar con %s: %v", peerURL, err)
-			continue
-		}
-		resp.Body.Close()
+		pushToPeer()
 	}
+}
+
+// bufferedWriter guarda la respuesta de un handler en memoria para poder
+// enviarla DESPUES de replicar el cambio.
+type bufferedWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *bufferedWriter) Header() http.Header         { return b.header }
+func (b *bufferedWriter) Write(p []byte) (int, error) { return b.body.Write(p) }
+func (b *bufferedWriter) WriteHeader(status int)      { b.status = status }
+
+// replicated envuelve los handlers que modifican el estado: si la operacion
+// tuvo exito, el cambio se copia al standby y a disco ANTES de responderle
+// al cliente (replicacion semi-sincrona). Asi, si el primario cae justo
+// despues de responder, el standby ya tiene ese cambio.
+func replicated(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		buf := &bufferedWriter{header: w.Header(), status: 200}
+		handler(buf, r)
+		if buf.status < 300 {
+			// Si el standby esta caido no se le espera: el ciclo periodico
+			// lo pondra al dia cuando vuelva.
+			if !peerDown.Load() {
+				pushToPeer()
+			}
+			persistState()
+		}
+		w.WriteHeader(buf.status)
+		_, _ = w.Write(buf.body.Bytes())
+	}
+}
+
+func queryPeer(client *http.Client) (peerStatus, error) {
+	var st peerStatus
+	resp, err := client.Get(peerURL + "/internal/health")
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close()
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	return st, err
 }
 
 func watchdogLoop() {
@@ -943,18 +1334,114 @@ func watchdogLoop() {
 			failures = 0
 			continue
 		}
-		resp, err := client.Get(peerURL + "/internal/health")
-		if err != nil {
+		st, err := queryPeer(client)
+		switch {
+		case err != nil:
 			failures++
 			log.Printf("[ControlNode] primario no responde (%d/3): %v", failures, err)
-		} else {
-			resp.Body.Close()
+		case st.Role != "primary":
+			// El peer responde pero tampoco es primario (p. ej. ambos
+			// arrancaron como standby): nadie atiende clientes.
+			failures++
+			log.Printf("[ControlNode] el peer responde pero es %s (%d/3)", st.Role, failures)
+		default:
 			failures = 0
+			setEpochIfHigher(st.Epoch)
 		}
 		if failures >= 3 {
-			log.Printf("[ControlNode] *** EL PRIMARIO NO RESPONDE: asumiendo rol de PRIMARIO ***")
-			setRole("primary")
+			promote()
+			log.Printf("[ControlNode] *** EL PRIMARIO NO RESPONDE: asumiendo rol de PRIMARIO (epoca %d) ***", getEpoch())
+			failures = 0
 		}
+	}
+}
+
+// resolveInitialRole decide el rol de arranque preguntandole al peer.
+func resolveInitialRole() {
+	if peerURL != "" {
+		client := newSecureHTTPClient(2 * time.Second)
+		for attempt := 1; attempt <= 3; attempt++ {
+			st, err := queryPeer(client)
+			if err == nil {
+				if st.Role == "primary" {
+					if st.Epoch >= epoch {
+						if role == "primary" {
+							log.Printf("[ControlNode] el peer ya es primario (epoca %d): arranco como STANDBY", st.Epoch)
+						}
+						role = "standby"
+						epoch = st.Epoch
+						return
+					}
+					// Mi estado en disco es mas nuevo que el del peer (p. ej.
+					// ambos cayeron y el peer arranco con datos viejos): asumo
+					// como primario y el peer se degradara al ver mi epoca.
+					log.Printf("[ControlNode] el peer es primario con epoca %d < mi epoca guardada %d: asumo PRIMARIO", st.Epoch, epoch)
+					role = "primary"
+					return
+				}
+				break // el peer responde y es standby: respeto CN_ROLE
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
+	if role == "primary" && epoch == 0 {
+		epoch = 1
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Persistencia de metadatos: el estado (arbol, usuarios, sesiones, epoca) se
+// guarda en disco cada pocos segundos, para sobrevivir aunque caigan los dos
+// ControlNodes a la vez. Se escribe a un .tmp y se renombra (atomico).
+// ----------------------------------------------------------------------------
+
+func loadStateFromDisk() {
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return
+	}
+	var snap StateSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		log.Printf("[ControlNode] estado en %s ilegible, se ignora: %v", stateFile, err)
+		return
+	}
+	if snap.FSTree["/"].Type != "dir" {
+		log.Printf("[ControlNode] estado en %s sin raiz, se ignora", stateFile)
+		return
+	}
+	importState(snap)
+	epoch = snap.Epoch
+	log.Printf("[ControlNode] estado restaurado de %s (epoca %d, %d entradas)", stateFile, snap.Epoch, len(snap.FSTree))
+}
+
+var (
+	persistMu   sync.Mutex
+	lastPersist []byte
+)
+
+func persistState() {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	data, err := json.Marshal(exportState())
+	if err != nil || bytes.Equal(data, lastPersist) {
+		return
+	}
+	tmp := stateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("[ControlNode] no se pudo guardar el estado: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, stateFile); err != nil {
+		log.Printf("[ControlNode] no se pudo guardar el estado: %v", err)
+		return
+	}
+	lastPersist = data
+}
+
+func persistLoop() {
+	for {
+		time.Sleep(3 * time.Second)
+		persistState()
 	}
 }
 
@@ -978,6 +1465,12 @@ func withMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// main
+// ----------------------------------------------------------------------------
+
+const defaultClusterSecret = "dfsha-cluster-secret-CAMBIAR"
+
 func main() {
 	host := getEnv("CN_HOST", "0.0.0.0")
 	port := getEnv("CN_PORT", "5000")
@@ -985,35 +1478,59 @@ func main() {
 	replicationFactor = getEnvInt("REPLICATION_FACTOR", 2)
 	heartbeatTimeout = time.Duration(getEnvInt("HEARTBEAT_TIMEOUT_SECONDS", 15)) * time.Second
 	writeQuorum = getEnvInt("WRITE_QUORUM", replicationFactor/2+1)
+	tokenTTL = time.Duration(getEnvInt("TOKEN_TTL_HOURS", 8)) * time.Hour
+	uploadTimeout = time.Duration(getEnvInt("UPLOAD_TIMEOUT_MINUTES", 30)) * time.Minute
+	stateFile = getEnv("CN_STATE_FILE", "./controlnode_state.json")
 
 	role = getEnv("CN_ROLE", "primary")
+	if role != "primary" && role != "standby" {
+		log.Fatalf("[ControlNode] CN_ROLE debe ser 'primary' o 'standby' (llego %q)", role)
+	}
+	configuredRole = role
 	peerURL = getEnv("CN_PEER_URL", "")
 	certFile = getEnv("CERT_FILE", "../certs/cert.pem")
 	keyFile = getEnv("KEY_FILE", "../certs/key.pem")
+	clusterSecret = getEnv("CLUSTER_SECRET", defaultClusterSecret)
+	if clusterSecret == defaultClusterSecret {
+		log.Printf("[ControlNode] AVISO: CLUSTER_SECRET tiene el valor por defecto; cambialo en despliegue real")
+	}
+	blockTLS = &tls.Config{RootCAs: loadCAPool(), MinVersion: tls.VersionTLS12}
+
+	loadStateFromDisk()
+	resolveInitialRole()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/auth/register", requirePrimary(withMethod("POST", handleRegister)))
-	mux.HandleFunc("/auth/login", requirePrimary(withMethod("POST", handleLogin)))
-	mux.HandleFunc("/fs/mkdir", requirePrimary(withMethod("POST", handleMkdir)))
+	mux.HandleFunc("/auth/register", requirePrimary(withMethod("POST", replicated(handleRegister))))
+	mux.HandleFunc("/auth/login", requirePrimary(withMethod("POST", replicated(handleLogin))))
+	mux.HandleFunc("/fs/mkdir", requirePrimary(withMethod("POST", replicated(handleMkdir))))
 	mux.HandleFunc("/fs/ls", requirePrimary(withMethod("GET", handleLs)))
-	mux.HandleFunc("/fs/rmdir", requirePrimary(withMethod("DELETE", handleRmdir)))
-	mux.HandleFunc("/fs/rm", requirePrimary(withMethod("DELETE", handleRm)))
-	mux.HandleFunc("/files/put/init", requirePrimary(withMethod("POST", handlePutInit)))
-	mux.HandleFunc("/files/put/complete", requirePrimary(withMethod("POST", handlePutComplete)))
+	mux.HandleFunc("/fs/rmdir", requirePrimary(withMethod("DELETE", replicated(handleRmdir))))
+	mux.HandleFunc("/fs/rm", requirePrimary(withMethod("DELETE", replicated(handleRm))))
+	mux.HandleFunc("/files/put/init", requirePrimary(withMethod("POST", replicated(handlePutInit))))
+	mux.HandleFunc("/files/put/complete", requirePrimary(withMethod("POST", replicated(handlePutComplete))))
 	mux.HandleFunc("/files/get", requirePrimary(withMethod("GET", handleGetFile)))
-	mux.HandleFunc("/datanodes/register", requirePrimary(withMethod("POST", handleDatanodeRegister)))
-	mux.HandleFunc("/datanodes/heartbeat", requirePrimary(withMethod("POST", handleHeartbeat)))
+	mux.HandleFunc("/datanodes/register", requireClusterSecret(requirePrimary(withMethod("POST", replicated(handleDatanodeRegister)))))
+	mux.HandleFunc("/datanodes/heartbeat", requireClusterSecret(requirePrimary(withMethod("POST", handleHeartbeat))))
 	mux.HandleFunc("/datanodes/status", withMethod("GET", handleDatanodesStatus))
-	mux.HandleFunc("/internal/health", handleInternalHealth)
-	mux.HandleFunc("/internal/sync", withMethod("POST", handleInternalSync))
+	mux.HandleFunc("/internal/health", withMethod("GET", handleInternalHealth))
+	mux.HandleFunc("/internal/sync", requireClusterSecret(withMethod("POST", handleInternalSync)))
 
+	syncClient = newSecureHTTPClient(3 * time.Second)
 	go replicationLoop()
 	go watchdogLoop()
 	go reReplicationLoop()
+	go persistLoop()
 
 	addr := host + ":" + port
-	log.Printf("[ControlNode] escuchando en %s (rol=%s, block_size=%d, replication=%d, TLS=on)", addr, role, blockSize, replicationFactor)
-	if err := http.ListenAndServeTLS(addr, certFile, keyFile, mux); err != nil {
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Printf("[ControlNode] escuchando en %s (rol=%s, epoca=%d, block_size=%d, replication=%d, TLS=on)",
+		addr, getRole(), getEpoch(), blockSize, replicationFactor)
+	if err := server.ListenAndServeTLS(certFile, keyFile); err != nil {
 		log.Fatal(err)
 	}
 }

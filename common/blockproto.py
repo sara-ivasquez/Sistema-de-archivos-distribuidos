@@ -1,46 +1,69 @@
 """
-Protocolo de transferencia de bloques (Cliente<->DataNode y DataNode<->DataNode).
+Protocolo de transferencia de bloques del cliente DFSha (Cliente <-> DataNode).
 
-Este modulo implementa, sobre sockets TCP puros, el MISMO contrato de mensajes
-definido en proto/block_service.proto (PutBlock, GetBlock, DeleteBlock). Se usa
-como referencia funcional porque el entorno de pruebas no tenia acceso a
-internet para instalar grpcio; la migracion a gRPC real es directa (ver
-README.md, seccion "Migrar a gRPC real") porque los mensajes y la semantica
-son identicos.
+Implementa sobre TCP + TLS el contrato descrito en proto/block_service.proto.
+El servidor es datanode_go/main.go; el ControlNode (controlnode_go/main.go)
+usa este mismo framing para DELETE y REPLICATE, y los DataNodes entre si
+para PUT_RAW.
 
 Formato de un REQUEST (big-endian / network byte order):
-    1 byte   -> opcode (1=PUT, 2=GET, 3=DELETE)
+    1 byte   -> opcode (1=PUT, 2=GET, 3=DELETE, 4=REPLICATE, 5=PUT_RAW)
     4 bytes  -> longitud del block_id (uint32)
-    N bytes  -> block_id (utf-8)
-    [solo PUT] 8 bytes -> longitud de los datos (uint64)
-    [solo PUT] M bytes -> datos crudos del bloque
+    N bytes  -> block_id (solo [A-Za-z0-9_-])
+    [DELETE/REPLICATE/PUT_RAW] 2 bytes len(secreto) + secreto del cluster
+    [PUT/PUT_RAW] 8 bytes len(datos) (uint64) + datos crudos del bloque
+    [REPLICATE]   2 bytes len(host) + host destino + 2 bytes puerto destino
 
 Formato de una RESPONSE:
     1 byte   -> status (1=ok, 0=error)
     4 bytes  -> longitud del payload (uint32)
-    K bytes  -> payload:
-                  - PUT/DELETE: mensaje de texto (utf-8)
-                  - GET (ok): bytes crudos del bloque
-                  - GET (error): mensaje de texto (utf-8)
+    K bytes  -> payload (bytes del bloque en GET ok; mensaje de texto si no)
+
+El cliente solo usa PUT y GET. DELETE, REPLICATE y PUT_RAW exigen el
+secreto del cluster, asi que un cliente no puede borrar ni copiar bloques.
 """
 
+import os
 import socket
+import ssl
 import struct
 
 OP_PUT = 1
 OP_GET = 2
-OP_DELETE = 3
 
 STATUS_OK = 1
 STATUS_ERROR = 0
 
+DEFAULT_CA = os.path.join(os.path.dirname(__file__), "..", "certs", "cert.pem")
+_ssl_context = None
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+
+def ssl_context() -> ssl.SSLContext:
+    """Contexto TLS que confia solo en el certificado del cluster DFSha."""
+    global _ssl_context
+    if _ssl_context is None:
+        ca = os.environ.get("DFSHA_CA_CERT", DEFAULT_CA)
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        _ssl_context = ctx
+    return _ssl_context
+
+
+def _connect(host: str, port: int, timeout: float) -> ssl.SSLSocket:
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        return ssl_context().wrap_socket(raw, server_hostname=host)
+    except Exception:
+        raw.close()
+        raise
+
+
+def _recv_exact(sock, n: int) -> bytes:
     """Lee exactamente n bytes del socket (TCP puede entregar datos en partes)."""
     chunks = []
     remaining = n
     while remaining > 0:
-        chunk = sock.recv(remaining)
+        chunk = sock.recv(min(remaining, 1 << 20))
         if not chunk:
             raise ConnectionError("Conexion cerrada antes de completar el mensaje")
         chunks.append(chunk)
@@ -48,7 +71,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return b"".join(chunks)
 
 
-def send_request(sock: socket.socket, opcode: int, block_id: str, data: bytes = b""):
+def _send_request(sock, opcode: int, block_id: str, data: bytes = b""):
     block_id_bytes = block_id.encode("utf-8")
     header = struct.pack("!BI", opcode, len(block_id_bytes)) + block_id_bytes
     if opcode == OP_PUT:
@@ -58,47 +81,25 @@ def send_request(sock: socket.socket, opcode: int, block_id: str, data: bytes = 
         sock.sendall(data)
 
 
-def recv_request(sock: socket.socket):
-    """Usado por el servidor (DataNode) para leer una solicitud entrante."""
-    opcode, block_id_len = struct.unpack("!BI", _recv_exact(sock, 5))
-    block_id = _recv_exact(sock, block_id_len).decode("utf-8")
-    data = b""
-    if opcode == OP_PUT:
-        (data_len,) = struct.unpack("!Q", _recv_exact(sock, 8))
-        data = _recv_exact(sock, data_len)
-    return opcode, block_id, data
-
-
-def send_response(sock: socket.socket, status: int, payload: bytes):
-    sock.sendall(struct.pack("!BI", status, len(payload)) + payload)
-
-
-def recv_response(sock: socket.socket):
+def _recv_response(sock):
     status, payload_len = struct.unpack("!BI", _recv_exact(sock, 5))
     payload = _recv_exact(sock, payload_len) if payload_len else b""
     return status, payload
 
 
 def put_block(host: str, port: int, block_id: str, data: bytes, timeout: float = 10.0) -> bool:
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        send_request(sock, OP_PUT, block_id, data)
-        status, payload = recv_response(sock)
+    with _connect(host, port, timeout) as sock:
+        _send_request(sock, OP_PUT, block_id, data)
+        status, payload = _recv_response(sock)
         if status != STATUS_OK:
             raise RuntimeError(f"PutBlock fallo en {host}:{port} -> {payload.decode(errors='replace')}")
         return True
 
 
 def get_block(host: str, port: int, block_id: str, timeout: float = 10.0) -> bytes:
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        send_request(sock, OP_GET, block_id)
-        status, payload = recv_response(sock)
+    with _connect(host, port, timeout) as sock:
+        _send_request(sock, OP_GET, block_id)
+        status, payload = _recv_response(sock)
         if status != STATUS_OK:
             raise RuntimeError(f"GetBlock fallo en {host}:{port} -> {payload.decode(errors='replace')}")
         return payload
-
-
-def delete_block(host: str, port: int, block_id: str, timeout: float = 5.0) -> bool:
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        send_request(sock, OP_DELETE, block_id)
-        status, _ = recv_response(sock)
-        return status == STATUS_OK

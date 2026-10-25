@@ -1,0 +1,31 @@
+# UN DataNode por maquina virtual (AWS Academy / GCP).
+# Uso, en la VM (desde la raiz del repo):
+#   cp docker/aws/nodo.env.example docker/aws/.env   # y editarlo
+#   docker compose -f docker/aws/datanode.compose.yml --env-file docker/aws/.env up --build -d
+#
+# El puerto se publica igual dentro y fuera del contenedor, porque el
+# DataNode le anuncia al ControlNode DN_PUBLIC_HOST:DN_PORT y los clientes
+# y demas DataNodes se conectan directamente a esa direccion.
+services:
+  datanode:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.datanode-go
+    restart: unless-stopped
+    environment:
+      DN_PORT: ${DN_PORT:-6001}
+      DN_API_PORT: ${DN_API_PORT:-7001}
+      DN_PUBLIC_HOST: ${DN_PUBLIC_HOST:?IP publica (o elastica) de esta VM}
+      CONTROLNODE_URLS: ${CONTROLNODE_URLS:?https://IP_CN1:5000,https://IP_CN2:5000}
+      DN_CAPACITY: ${DN_CAPACITY:-5368709120}
+      CLUSTER_SECRET: ${CLUSTER_SECRET:?}
+      DN_ENCRYPTION_KEY: ${DN_ENCRYPTION_KEY:?}
+    ports:
+      - "${DN_PORT:-6001}:${DN_PORT:-6001}"
+      - "${DN_API_PORT:-7001}:${DN_API_PORT:-7001}"
+    volumes:
+      - ../../certs:/certs:ro
+      - dn_data:/data
+
+volumes:
+  dn_data:

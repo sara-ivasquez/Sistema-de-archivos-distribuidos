@@ -2,12 +2,16 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY controlnode_go/ .
-RUN go build -o /controlnode .
+RUN CGO_ENABLED=0 go build -o /controlnode .
 
 # Etapa final (imagen minima, solo el binario)
 FROM alpine:3.20
 COPY --from=build /controlnode /controlnode
-ENV CN_HOST=0.0.0.0
-ENV CN_PORT=5000
+ENV CN_HOST=0.0.0.0 \
+    CN_PORT=5000 \
+    CERT_FILE=/certs/cert.pem \
+    KEY_FILE=/certs/key.pem \
+    CN_STATE_FILE=/data/controlnode_state.json
+VOLUME ["/data"]
 EXPOSE 5000
 ENTRYPOINT ["/controlnode"]
