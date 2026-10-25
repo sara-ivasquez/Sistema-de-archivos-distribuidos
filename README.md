@@ -219,7 +219,10 @@ alcanzan los demás), `DN_STORAGE_DIR` (./storage), `DN_CAPACITY` (1 GB),
 `DN_ENCRYPTION_KEY` (clave de cifrado en reposo, igual en todos).
 
 **Cliente**: `DFSHA_CONTROLNODE_URL` (lista separada por comas) o `--url`,
-`DFSHA_CA_CERT` (`certs/cert.pem`), `DFSHA_WORKERS` (4).
+`DFSHA_CA_CERT` (`certs/cert.pem`), `DFSHA_WORKERS` (4). Para transferencias
+por Internet: `DFSHA_MIN_RATE_KBPS` (64; el plazo de cada bloque es
+30 s + tamaño / esa velocidad), `DFSHA_BLOCK_TIMEOUT` (120 s para lecturas),
+`DFSHA_CONNECT_TIMEOUT` (10 s) y `DFSHA_RETRIES` (2 reintentos ante fallos de red).
 
 ## Algoritmo de particionamiento y colocación
 
