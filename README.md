@@ -290,6 +290,45 @@ Response: status(1: 1=ok, 0=error) | len(payload)(4) | payload
 - Las sesiones se replican, así que tras el failover el cliente sigue sin
   volver a hacer login.
 
-## Pendiente
+## Despliegue en AWS Academy
 
-- Despliegue y medición en AWS (ver `docs/despliegue-aws.md`).
+El sistema está desplegado en **AWS Academy (EC2, IaaS)**, región
+`us-east-1`, con **un nodo por máquina virtual**, cada uno en su contenedor
+Docker y comunicándose por Internet con los puertos expuestos:
+
+| VM | Nodo | Tipo | Puertos |
+|---|---|---|---|
+| dfsha-cn1 | ControlNode primario | t3.small, Ubuntu 24.04 | 5000 |
+| dfsha-cn2 | ControlNode standby | t3.small, Ubuntu 24.04 | 5000 |
+| dfsha-dn1 | DataNode | t3.small, Ubuntu 24.04 | 6001, 7001 |
+| dfsha-dn2 | DataNode | t3.small, Ubuntu 24.04 | 6001, 7001 |
+| dfsha-dn3 | DataNode | t3.small, Ubuntu 24.04 | 6001, 7001 |
+
+- Cada VM tiene una IP elástica (fija), incluida en el certificado TLS del clúster.
+- Un Security Group abre solo los puertos 22, 5000, 6001-6003 y 7001-7003.
+- Configuración: `BLOCK_SIZE` = 4 MB, `REPLICATION_FACTOR` = 2, quórum de escritura 2.
+- El cliente corre en el PC del usuario, fuera de AWS, y habla con los
+  ControlNodes y DataNodes por Internet.
+
+Los pasos completos están en [docs/despliegue-aws.md](docs/despliegue-aws.md).
+
+**Verificación realizada** (cliente en un PC con conexión doméstica → AWS us-east-1):
+
+| Operación | Tamaño | Bloques | Tiempo | Throughput | Resultado |
+|---|---|---|---|---|---|
+| `put` | 20 MB | 5 × 4 MB, 2 réplicas | 14,2 s | 1,41 MB/s | 5/5 bloques con 2/2 réplicas |
+| `get` | 20 MB | 5, leídos de los 3 DataNodes | 13,7 s | 1,47 MB/s | SHA-256 idéntico al original |
+
+El throughput está limitado por el ancho de banda del cliente (conexión
+doméstica), no por el sistema. En el primer intento, una réplica no confirmó
+a tiempo y el cliente abortó la subida en lugar de dejar el archivo con menos
+copias (quórum de escritura). Eso llevó a ajustar los plazos de transferencia
+para Internet (`DFSHA_MIN_RATE_KBPS`, `DFSHA_RETRIES`).
+
+## Trabajo futuro
+
+- Control de acceso por **grupos** y archivos compartidos entre usuarios (ACL).
+- Autenticación adicional: **API Keys** y **2FA** (TOTP).
+- Migrar la API de bloques del framing binario propio a **gRPC** real
+  (el contrato ya está definido en `proto/block_service.proto`).
+- Más de dos ControlNodes con consenso (p. ej. Raft) en lugar de primario/standby.
