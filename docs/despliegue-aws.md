@@ -113,7 +113,12 @@ En Windows (PowerShell): `$env:DFSHA_CONTROLNODE_URL="https://IP_CN1:5000,https:
    STANDBY" y el estado sigue intacto.
 7. **Seguridad**: login de un segundo usuario que no ve los archivos del
    primero. Mostrar un bloque en el disco del DataNode (está cifrado).
-8. **RF3 y concurrencia**: abrir dos terminales con `python client/cli.py shell`.
+8. **Escalabilidad / rebalanceo**: lanzar una 6.ª VM con un DataNode nuevo
+   (`docker compose -f docker/aws/datanode.compose.yml ... up -d`). En ~20 s,
+   el log del ControlNode muestra "rebalanceo: N bloque(s) movidos". En
+   `/health` de cada DataNode, `num_blocks` queda parejo. (Recuerda incluir
+   su IP al generar el certificado.)
+9. **RF3 y concurrencia**: abrir dos terminales con `python client/cli.py shell`.
    - En la primera: `open /notas.txt rw create` → `write 3 hola`. Aún no hagas `close`.
    - En la segunda: `open /notas.txt rw` → "bloqueado por otro proceso".
    - En la segunda: `open /notas.txt r` → `lock 3 shared` → también bloqueado.

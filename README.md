@@ -25,7 +25,8 @@ docker/           Dockerfiles, docker-compose.yml (todo en una máquina)
 docker/aws/       Compose de UN nodo por VM (AWS Academy / GCP)
 docs/             Guía de despliegue en AWS
 pruebas/          Pruebas end-to-end: prueba_local.sh (failover, caídas,
-                  permisos) y prueba_rf3.sh (open/read/write/lock)
+                  permisos), prueba_rf3.sh (open/read/write/lock) y
+                  prueba_rebalanceo.sh
 ```
 
 ## Cómo cumple cada requisito
@@ -39,7 +40,7 @@ pruebas/          Pruebas end-to-end: prueba_local.sh (failover, caídas,
 | RNF1 Escalabilidad | Bloques de tamaño fijo repartidos entre N DataNodes. `put`/`get` en paralelo (`DFSHA_WORKERS`) |
 | RNF2 Alta disponibilidad | 2 ControlNodes primario/standby con épocas (sin *split-brain*), failover automático y transparente (sesiones replicadas). Cada bloque en `REPLICATION_FACTOR` DataNodes, con re-replicación automática al caer uno |
 | RNF3 Consistencia | Un solo escritor por archivo (lock exclusivo), commits atómicos con versión y consistencia *close-to-open*, quórum de escritura (`WRITE_QUORUM`), checksum SHA-256 por bloque verificado en `get`, replicación semi-síncrona de metadatos al standby antes de responder, escritura atómica de bloques y del estado |
-| RNF4 Particionamiento | Ver [algoritmo](#algoritmo-de-particionamiento-y-colocación) |
+| RNF4 Particionamiento | Ver [algoritmo](#algoritmo-de-particionamiento-y-colocación). Incluye rebalanceo automático al agregar DataNodes |
 | RNF5 Rendimiento y concurrencia | Transferencias paralelas por bloque (el cliente reporta MB/s). Múltiples lectores concurrentes con lock compartido; `read`/`write` solo tocan los bloques afectados |
 | RNF7 Transparencia | El SDK expone un objeto tipo archivo de Python (`read`, `write`, `seek`, `with`): el cliente no sabe en qué DataNodes está cada bloque ni qué ControlNode lo atiende |
 | RNF6 Seguridad | TLS 1.2+ en **todos** los canales (verificado contra el certificado del clúster), secreto compartido para operaciones internas, cifrado en reposo AES-256-GCM, control de acceso por dueño |
@@ -94,6 +95,7 @@ $env:DN_PORT="6001"; $env:DN_STORAGE_DIR=".\storage1"; go run main.go
 ```bash
 bash pruebas/prueba_local.sh   # failover, caídas de nodos, permisos (21 verificaciones)
 bash pruebas/prueba_rf3.sh     # open/read/write/lock, concurrencia, lease, failover con archivo abierto (26)
+bash pruebas/prueba_rebalanceo.sh  # agregar un DataNode y un nodo que vuelve tras caer (8)
 ```
 
 ## Cómo ejecutar (Docker Compose, todo en una máquina)
@@ -206,7 +208,8 @@ en todos), `CERT_FILE` (`../certs/cert.pem`), `KEY_FILE` (`../certs/key.pem`).
 `BLOCK_SIZE` (262144), `REPLICATION_FACTOR` (2), `WRITE_QUORUM` (N/2+1),
 `HEARTBEAT_TIMEOUT_SECONDS` (15), `TOKEN_TTL_HOURS` (8),
 `UPLOAD_TIMEOUT_MINUTES` (30), `CN_STATE_FILE` (`./controlnode_state.json`),
-`HANDLE_TTL_SECONDS` (60), `GC_DELAY_SECONDS` (60).
+`HANDLE_TTL_SECONDS` (60), `GC_DELAY_SECONDS` (60),
+`REBALANCE_ENABLED` (true), `REBALANCE_MAX_MOVES` (16).
 
 **DataNode**: `DN_HOST` (0.0.0.0), `DN_PORT` (6001), `DN_API_PORT`
 (DN_PORT+1000), `DN_PUBLIC_HOST` (127.0.0.1, la IP con la que lo
@@ -232,6 +235,24 @@ bloque, el ControlNode elige `REPLICATION_FACTOR` DataNodes activos así:
 Cada 10 s, el primario revisa que cada bloque tenga `REPLICATION_FACTOR`
 réplicas vivas. Si falta alguna, ordena a un DataNode que tenga el bloque
 que lo copie directamente (P2P) a otro DataNode sano.
+
+**Rebalanceo** (`controlnode_go/rebalanceo.go`). Cuando todos los bloques
+tienen sus réplicas completas, en la misma ronda el primario:
+
+1. **Recorta copias de más.** Si un DataNode caído vuelve después de que
+   sus bloques se re-replicaron, esos bloques quedan con más copias de las
+   necesarias. Se quita la copia del nodo más cargado.
+2. **Mueve bloques** del DataNode con más bloques al que tiene menos,
+   mientras la diferencia supere el 10 % del promedio, con un máximo de
+   `REBALANCE_MAX_MOVES` por ronda. Mover = copia P2P al destino, actualizar
+   metadatos y borrar la copia del origen después de `GC_DELAY_SECONDS`.
+   Así, un lector que abrió el archivo antes del cambio termina de leer sin
+   problemas.
+
+Justo antes de borrar cualquier copia se verifica que ningún archivo la
+siga referenciando. Los archivos abiertos para escritura no se mueven
+hasta que se cierran. Ejemplo de la prueba: agregar un 3.er DataNode a un
+clúster con 12 bloques ×2 réplicas lleva la carga de 12/12/0 a 8/8/8.
 
 ## Protocolos de comunicación (los 5 canales)
 
@@ -268,5 +289,4 @@ Response: status(1: 1=ok, 0=error) | len(payload)(4) | payload
 
 ## Pendiente
 
-- Rebalanceo de bloques al agregar un DataNode nuevo.
 - Despliegue y medición en AWS (ver `docs/despliegue-aws.md`).
