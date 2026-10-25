@@ -2,12 +2,14 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY datanode_go/ .
-RUN go build -o /datanode .
+RUN CGO_ENABLED=0 go build -o /datanode .
 
 # Etapa final (imagen minima, solo el binario)
 FROM alpine:3.20
 COPY --from=build /datanode /datanode
-ENV DN_HOST=0.0.0.0
-ENV DN_STORAGE_DIR=/data
+ENV DN_HOST=0.0.0.0 \
+    DN_STORAGE_DIR=/data \
+    CERT_FILE=/certs/cert.pem \
+    KEY_FILE=/certs/key.pem
 VOLUME ["/data"]
 ENTRYPOINT ["/datanode"]

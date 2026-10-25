@@ -1,80 +1,122 @@
+# DFSha completo en UNA maquina: 2 ControlNodes (primario/standby) + 3
+# DataNodes + cliente. Para desplegar cada nodo en una VM distinta (AWS/GCP)
+# ver docker/aws/ y docs/despliegue-aws.md.
+#
+# Antes de levantarlo:
+#   1. cd gencert && go run main.go      (crea ../certs/cert.pem y key.pem)
+#   2. cp docker/.env.example docker/.env y cambia los secretos
+#   3. cd docker && docker compose up --build -d
+#
+# Variables que se leen de docker/.env: CLUSTER_SECRET, DN_ENCRYPTION_KEY.
+
+x-controlnode: &controlnode
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.controlnode-go
+  restart: unless-stopped
+  volumes:
+    - ../certs:/certs:ro
+  networks: [dfsha-net]
+
+x-controlnode-env: &controlnode-env
+  BLOCK_SIZE: "1048576"            # 1 MB por bloque (en produccion, 64 MB)
+  REPLICATION_FACTOR: "2"
+  HEARTBEAT_TIMEOUT_SECONDS: "15"
+  CLUSTER_SECRET: ${CLUSTER_SECRET:?define CLUSTER_SECRET en docker/.env}
+
+x-datanode: &datanode
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.datanode-go
+  restart: unless-stopped
+  depends_on: [controlnode1, controlnode2]
+  networks: [dfsha-net]
+
+x-datanode-env: &datanode-env
+  CONTROLNODE_URLS: https://controlnode1:5000,https://controlnode2:5000
+  DN_CAPACITY: "1073741824"
+  CLUSTER_SECRET: ${CLUSTER_SECRET:?define CLUSTER_SECRET en docker/.env}
+  DN_ENCRYPTION_KEY: ${DN_ENCRYPTION_KEY:?define DN_ENCRYPTION_KEY en docker/.env}
+
 services:
-  controlnode:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.controlnode-go
-    ports:
-      - "5000:5000"
+  controlnode1:
+    <<: *controlnode
     environment:
-      - BLOCK_SIZE=1048576        # 1 MB por bloque (ajustar a 64MB en despliegue real)
-      - REPLICATION_FACTOR=2
-      - HEARTBEAT_TIMEOUT_SECONDS=15
-    networks: [dfsha-net]
+      <<: *controlnode-env
+      CN_ROLE: primary
+      CN_PEER_URL: https://controlnode2:5000
+    ports: ["5000:5000"]
+    volumes:
+      - ../certs:/certs:ro
+      - cn1_data:/data
+
+  controlnode2:
+    <<: *controlnode
+    environment:
+      <<: *controlnode-env
+      CN_ROLE: standby
+      CN_PEER_URL: https://controlnode1:5000
+    ports: ["5001:5000"]
+    volumes:
+      - ../certs:/certs:ro
+      - cn2_data:/data
 
   datanode1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.datanode-go
+    <<: *datanode
     environment:
-      - DN_PORT=6001
-      - DN_PUBLIC_HOST=datanode1   # nombre del servicio: resoluble por otros contenedores
-      - CONTROLNODE_URL=http://controlnode:5000
-      - DN_CAPACITY=1073741824
-    ports:
-      - "6001:6001"
+      <<: *datanode-env
+      DN_PORT: "6001"
+      DN_API_PORT: "7001"
+      DN_PUBLIC_HOST: datanode1     # nombre del servicio: resoluble por los demas contenedores
+    ports: ["6001:6001", "7001:7001"]
     volumes:
+      - ../certs:/certs:ro
       - dn1_data:/data
-    depends_on: [controlnode]
-    networks: [dfsha-net]
 
   datanode2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.datanode-go
+    <<: *datanode
     environment:
-      - DN_PORT=6002
-      - DN_PUBLIC_HOST=datanode2
-      - CONTROLNODE_URL=http://controlnode:5000
-      - DN_CAPACITY=1073741824
-    ports:
-      - "6002:6002"
+      <<: *datanode-env
+      DN_PORT: "6002"
+      DN_API_PORT: "7002"
+      DN_PUBLIC_HOST: datanode2
+    ports: ["6002:6002", "7002:7002"]
     volumes:
+      - ../certs:/certs:ro
       - dn2_data:/data
-    depends_on: [controlnode]
-    networks: [dfsha-net]
 
   datanode3:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.datanode-go
+    <<: *datanode
     environment:
-      - DN_PORT=6003
-      - DN_PUBLIC_HOST=datanode3
-      - CONTROLNODE_URL=http://controlnode:5000
-      - DN_CAPACITY=1073741824
-    ports:
-      - "6003:6003"
+      <<: *datanode-env
+      DN_PORT: "6003"
+      DN_API_PORT: "7003"
+      DN_PUBLIC_HOST: datanode3
+    ports: ["6003:6003", "7003:7003"]
     volumes:
+      - ../certs:/certs:ro
       - dn3_data:/data
-    depends_on: [controlnode]
-    networks: [dfsha-net]
 
+  # Cliente: no se levanta con "up"; se usa con
+  #   docker compose run --rm client <comando>
   client:
     build:
       context: ..
       dockerfile: docker/Dockerfile.client
     environment:
-      - DFSHA_CONTROLNODE_URL=http://controlnode:5000
+      DFSHA_CONTROLNODE_URL: https://controlnode1:5000,https://controlnode2:5000
     volumes:
-      - ../client_files:/work       # coloca aqui los archivos que quieras subir/bajar
-    depends_on: [controlnode, datanode1, datanode2, datanode3]
+      - ../certs:/certs:ro
+      - ../client_files:/work       # archivos a subir/bajar (y la sesion)
     networks: [dfsha-net]
-    profiles: ["tools"]             # no se levanta con 'docker compose up', solo con 'run'
+    profiles: ["tools"]
 
 networks:
   dfsha-net:
 
 volumes:
+  cn1_data:
+  cn2_data:
   dn1_data:
   dn2_data:
   dn3_data:

@@ -1,0 +1,25 @@
+# UN ControlNode por maquina virtual (AWS Academy / GCP).
+# Uso, en la VM (desde la raiz del repo):
+#   cp docker/aws/nodo.env.example docker/aws/.env   # y editarlo
+#   docker compose -f docker/aws/controlnode.compose.yml --env-file docker/aws/.env up --build -d
+services:
+  controlnode:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.controlnode-go
+    restart: unless-stopped
+    environment:
+      CN_PORT: "5000"
+      CN_ROLE: ${CN_ROLE:?primary o standby}
+      CN_PEER_URL: ${CN_PEER_URL:?https://IP_DEL_OTRO_CONTROLNODE:5000}
+      CLUSTER_SECRET: ${CLUSTER_SECRET:?}
+      BLOCK_SIZE: ${BLOCK_SIZE:-4194304}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      HEARTBEAT_TIMEOUT_SECONDS: ${HEARTBEAT_TIMEOUT_SECONDS:-15}
+    ports: ["5000:5000"]
+    volumes:
+      - ../../certs:/certs:ro
+      - cn_data:/data
+
+volumes:
+  cn_data:

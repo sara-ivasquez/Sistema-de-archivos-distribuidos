@@ -7,5 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY common/ ./common/
 COPY client/ ./client/
 
+ENV DFSHA_CA_CERT=/certs/cert.pem
 WORKDIR /work
 ENTRYPOINT ["python3", "/app/client/cli.py"]
