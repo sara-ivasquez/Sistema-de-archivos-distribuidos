@@ -14,6 +14,12 @@ Uso:
     python3 client/cli.py cd /
     python3 client/cli.py rmdir /docs
 
+Acceso a archivos (RF3, ver client/dfsha.py):
+    python3 client/cli.py cat notas.txt --offset 100 --length 50
+    python3 client/cli.py write notas.txt 0 "texto que sobrescribe desde el byte 0"
+    python3 client/cli.py write notas.txt end "texto que se agrega al final"
+    python3 client/cli.py shell      # open/read/write/seek/lock/close interactivos
+
 ControlNodes: --url o DFSHA_CONTROLNODE_URL, lista separada por comas
 (primario y standby). Si uno no responde o esta en standby (503), el
 cliente prueba el siguiente automaticamente (failover transparente).
@@ -29,6 +35,7 @@ import hashlib
 import json
 import os
 import posixpath
+import shlex
 import sys
 import threading
 import time
@@ -38,6 +45,7 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from common import blockproto  # noqa: E402
+from client.dfsha import DFSha, DFShaError  # noqa: E402
 
 SESSION_FILE = ".dfsha_session.json"
 DEFAULT_URLS = "https://127.0.0.1:5000,https://127.0.0.1:5001"
@@ -301,7 +309,140 @@ def cmd_get(args, session):
           f"({info['size'] / max(elapsed, 1e-6) / 1024 / 1024:.2f} MB/s).")
 
 
-def main():
+# ----------------------------------------------------------------------------
+# RF3: acceso a archivos (open/read/write/seek/lock/close) usando el SDK
+# ----------------------------------------------------------------------------
+
+def sdk_from_session(session):
+    auth_headers(session)  # exige login
+    return DFSha(session.get("urls") or resolve_urls(DEFAULT_URLS), token=session["token"],
+                 ca_cert=CA_CERT, workers=WORKERS, active_index=session.get("active_index", 0))
+
+
+def remember_active(session, fs):
+    if fs.active_index != session.get("active_index", 0):
+        print(f"(failover: ahora se usa el ControlNode {fs.urls[fs.active_index]})", file=sys.stderr)
+        session["active_index"] = fs.active_index
+        save_session(session)
+
+
+def cmd_cat(args, session):
+    """Lee un rango del archivo trayendo SOLO los bloques necesarios."""
+    fs = sdk_from_session(session)
+    try:
+        with fs.open(resolve_path(session, args.path), "r") as f:
+            f.seek(args.offset)
+            data = f.read(args.length)
+    except DFShaError as exc:
+        print("Error:", exc)
+        return
+    finally:
+        remember_active(session, fs)
+    sys.stdout.buffer.write(data)
+    if sys.stdout.isatty() and not data.endswith(b"\n"):
+        print()
+
+
+def cmd_write(args, session):
+    """Escribe en una posicion del archivo (lo crea si no existe)."""
+    fs = sdk_from_session(session)
+    data = open(args.from_file, "rb").read() if args.from_file else " ".join(args.text).encode()
+    try:
+        with fs.open(resolve_path(session, args.path), "rw", create=True) as f:
+            f.seek(0, 2) if args.offset == "end" else f.seek(int(args.offset))
+            f.write(data)
+        print(f"OK: {len(data)} bytes escritos; el archivo ahora mide {f.size} bytes (version {f.version}).")
+    except DFShaError as exc:
+        print("Error:", exc)
+    finally:
+        remember_active(session, fs)
+
+
+SHELL_HELP = """Comandos del shell DFSha:
+  open <ruta> [r|rw] [create]   abre un archivo y devuelve un descriptor (fd)
+  read <fd> [n]                 lee n bytes (o hasta el final) desde la posicion actual
+  write <fd> <texto...>         escribe en la posicion actual (requiere rw)
+  seek <fd> <pos|end>           mueve la posicion
+  lock <fd> [shared|exclusive]  toma un lock;  unlock <fd>  lo suelta
+  flush <fd>                    sube y confirma lo escrito sin cerrar
+  close <fd>                    flush + cierra (libera el lock)
+  files                         lista los archivos abiertos
+  ls, cd, pwd, mkdir, rm, put, get, ...   igual que en la linea de comandos
+  exit"""
+
+
+def cmd_shell(args, session):
+    fs = sdk_from_session(session)
+    parser = build_parser()
+    fds, next_fd = {}, 3
+    print("Shell DFSha (escribe 'help'). Usuario:", session.get("username"))
+    while True:
+        try:
+            line = input(f"dfsha:{session.get('cwd', '/')}> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            line = "exit"
+        if not line:
+            continue
+        parts = shlex.split(line)
+        cmd, rest = parts[0], parts[1:]
+        try:
+            if cmd in ("exit", "quit"):
+                for f in fds.values():
+                    f.close()
+                return
+            elif cmd == "help":
+                print(SHELL_HELP)
+            elif cmd == "open":
+                mode = rest[1] if len(rest) > 1 else "r"
+                f = fs.open(resolve_path(session, rest[0]), mode, create="create" in rest[2:])
+                fds[next_fd] = f
+                print(f"fd {next_fd}: {f}")
+                next_fd += 1
+            elif cmd == "files":
+                for fd, f in fds.items():
+                    print(f"  fd {fd}: {f}")
+            elif cmd in ("read", "write", "seek", "lock", "unlock", "flush", "close"):
+                fd = int(rest[0])
+                if fd not in fds:
+                    print(f"el fd {fd} no existe (usa 'files' para ver los abiertos)")
+                    continue
+                f = fds[fd]
+                if cmd == "read":
+                    data = f.read(int(rest[1]) if len(rest) > 1 else -1)
+                    print(repr(data.decode("utf-8", errors="replace")))
+                elif cmd == "write":
+                    print(f"{f.write(' '.join(rest[1:]).encode())} bytes en el buffer (se suben con flush/close)")
+                elif cmd == "seek":
+                    print("posicion", f.seek(0, 2) if rest[1] == "end" else f.seek(int(rest[1])))
+                elif cmd == "lock":
+                    print("lock:", f.lock(rest[1] if len(rest) > 1 else "exclusive"))
+                elif cmd == "unlock":
+                    f.unlock()
+                    print("lock liberado")
+                elif cmd == "flush":
+                    f.flush()
+                    print(f"confirmado: {f}")
+                elif cmd == "close":
+                    f.close()
+                    del fds[fd]
+                    print(f"fd {fd} cerrado (version {f.version}, {f.size} bytes)")
+            elif cmd == "shell":
+                print("ya estas en el shell")
+            else:
+                sub = parser.parse_args(parts)
+                COMMANDS[sub.command](sub, session)
+        except DFShaError as exc:
+            print("Error:", exc)
+        except (KeyError, IndexError, ValueError) as exc:
+            print("Uso invalido:", exc, "(escribe 'help')")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print(exc.code if isinstance(exc.code, str) else "comando fallido")
+        remember_active(session, fs)
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="Cliente DFSha")
     parser.add_argument("--url", default=os.environ.get("DFSHA_CONTROLNODE_URL", DEFAULT_URLS),
                         help="ControlNodes separados por coma (solo para register/login)")
@@ -317,16 +458,30 @@ def main():
     p = sub.add_parser("rm"); p.add_argument("path")
     p = sub.add_parser("put"); p.add_argument("local_path"); p.add_argument("remote_path")
     p = sub.add_parser("get"); p.add_argument("remote_path"); p.add_argument("local_path")
+    # RF2 con los nombres del enunciado
+    p = sub.add_parser("send", help="= put"); p.add_argument("local_path"); p.add_argument("remote_path")
+    p = sub.add_parser("receive", help="= get"); p.add_argument("remote_path"); p.add_argument("local_path")
+    # RF3
+    p = sub.add_parser("cat", help="lee un rango de un archivo")
+    p.add_argument("path"); p.add_argument("--offset", type=int, default=0); p.add_argument("--length", type=int, default=-1)
+    p = sub.add_parser("write", help="escribe en una posicion de un archivo")
+    p.add_argument("path"); p.add_argument("offset", help="byte inicial, o 'end' para agregar al final")
+    p.add_argument("text", nargs="*"); p.add_argument("--from-file", dest="from_file")
+    sub.add_parser("shell", help="shell interactivo con open/read/write/lock/close")
+    return parser
 
-    args = parser.parse_args()
-    session = load_session()
 
-    dispatch = {
-        "register": cmd_register, "login": cmd_login, "pwd": cmd_pwd, "cd": cmd_cd,
-        "mkdir": cmd_mkdir, "rmdir": cmd_rmdir, "ls": cmd_ls, "rm": cmd_rm,
-        "put": cmd_put, "get": cmd_get,
-    }
-    dispatch[args.command](args, session)
+COMMANDS = {
+    "register": cmd_register, "login": cmd_login, "pwd": cmd_pwd, "cd": cmd_cd,
+    "mkdir": cmd_mkdir, "rmdir": cmd_rmdir, "ls": cmd_ls, "rm": cmd_rm,
+    "put": cmd_put, "get": cmd_get, "send": cmd_put, "receive": cmd_get,
+    "cat": cmd_cat, "write": cmd_write, "shell": cmd_shell,
+}
+
+
+def main():
+    args = build_parser().parse_args()
+    COMMANDS[args.command](args, load_session())
 
 
 if __name__ == "__main__":

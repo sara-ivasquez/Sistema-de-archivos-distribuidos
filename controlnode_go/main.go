@@ -28,6 +28,7 @@
 //	CLUSTER_SECRET (secreto compartido con DataNodes y el otro ControlNode)
 //	TOKEN_TTL_HOURS (default 8), UPLOAD_TIMEOUT_MINUTES (default 30)
 //	CN_STATE_FILE (default ./controlnode_state.json)
+//	HANDLE_TTL_SECONDS (default 60), GC_DELAY_SECONDS (default 60)  [RF3]
 package main
 
 import (
@@ -175,6 +176,7 @@ type FSEntry struct {
 	Blocks    []Block         `json:"blocks,omitempty"`
 	Status    string          `json:"status,omitempty"`
 	CreatedAt time.Time       `json:"-"`
+	Version   int             `json:"-"` // sube en cada commit de RF3 (write)
 }
 
 type DataNodeInfo struct {
@@ -195,6 +197,7 @@ type FSEntrySnapshot struct {
 	Blocks    []Block   `json:"blocks,omitempty"`
 	Status    string    `json:"status,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
+	Version   int       `json:"version,omitempty"`
 }
 
 type DataNodeSnapshot struct {
@@ -219,6 +222,8 @@ type StateSnapshot struct {
 	Tokens    map[string]TokenInfo        `json:"tokens"`
 	FSTree    map[string]FSEntrySnapshot  `json:"fs_tree"`
 	DataNodes map[string]DataNodeSnapshot `json:"datanodes"`
+	Handles   map[string]Handle           `json:"handles"`
+	Garbage   []GarbageBlock              `json:"garbage,omitempty"`
 }
 
 func exportState() StateSnapshot {
@@ -230,6 +235,13 @@ func exportState() StateSnapshot {
 		Tokens:    map[string]TokenInfo{},
 		FSTree:    map[string]FSEntrySnapshot{},
 		DataNodes: map[string]DataNodeSnapshot{},
+		Handles:   map[string]Handle{},
+		Garbage:   append([]GarbageBlock{}, garbage...),
+	}
+	for id, h := range handles {
+		hc := *h
+		hc.Pending = append([]Block{}, h.Pending...)
+		snap.Handles[id] = hc
 	}
 	for u, h := range users {
 		snap.Users[u] = h
@@ -245,7 +257,7 @@ func exportState() StateSnapshot {
 		snap.FSTree[p] = FSEntrySnapshot{
 			Type: e.Type, Children: children, Owner: e.Owner,
 			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
-			CreatedAt: e.CreatedAt,
+			CreatedAt: e.CreatedAt, Version: e.Version,
 		}
 	}
 	for id, dn := range datanodes {
@@ -281,10 +293,18 @@ func importState(snap StateSnapshot) {
 		newFSTree[p] = &FSEntry{
 			Type: e.Type, Children: children, Owner: e.Owner,
 			Size: e.Size, BlockSize: e.BlockSize, Blocks: e.Blocks, Status: e.Status,
-			CreatedAt: e.CreatedAt,
+			CreatedAt: e.CreatedAt, Version: e.Version,
 		}
 	}
 	fsTree = newFSTree
+
+	newHandles := map[string]*Handle{}
+	for id, h := range snap.Handles {
+		hc := h
+		newHandles[id] = &hc
+	}
+	handles = newHandles
+	garbage = append([]GarbageBlock{}, snap.Garbage...)
 
 	newDatanodes := map[string]*DataNodeInfo{}
 	for id, d := range snap.DataNodes {
@@ -651,7 +671,12 @@ func handleRm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 403, "no tienes permiso sobre "+p)
 		return
 	}
-	blocks := node.Blocks
+	if lockConflict(p, "", "exclusive") {
+		mu.Unlock()
+		writeError(w, 423, "el archivo esta bloqueado por otro proceso")
+		return
+	}
+	blocks := discardBlocks(p, node.Blocks)
 	parent := normPath(path.Dir(p))
 	delete(fsTree[parent].Children, p)
 	delete(fsTree, p)
@@ -732,6 +757,10 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 403, "no tienes permiso sobre "+p)
 			return
 		}
+		if lockConflict(p, "", "exclusive") {
+			writeError(w, 423, "el archivo esta bloqueado por otro proceso")
+			return
+		}
 	}
 	if len(aliveDatanodes()) == 0 {
 		writeError(w, 503, "no hay DataNodes disponibles")
@@ -753,7 +782,7 @@ func handlePutInit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if existing, exists := fsTree[p]; exists {
-		oldBlocks = existing.Blocks // sobrescritura: la version vieja se borra
+		oldBlocks = discardBlocks(p, existing.Blocks) // sobrescritura: la version vieja se borra
 	}
 	fsTree[p] = &FSEntry{
 		Type: "file", Size: body.Size, BlockSize: blockSize,
@@ -1035,6 +1064,7 @@ func reReplicationLoop() {
 		}
 		mu.Unlock()
 
+		abandoned = append(abandoned, expireHandlesAndGC()...)
 		if len(abandoned) > 0 {
 			deleteBlocksRemote(abandoned)
 		}
@@ -1481,6 +1511,8 @@ func main() {
 	tokenTTL = time.Duration(getEnvInt("TOKEN_TTL_HOURS", 8)) * time.Hour
 	uploadTimeout = time.Duration(getEnvInt("UPLOAD_TIMEOUT_MINUTES", 30)) * time.Minute
 	stateFile = getEnv("CN_STATE_FILE", "./controlnode_state.json")
+	handleTTL = time.Duration(getEnvInt("HANDLE_TTL_SECONDS", 60)) * time.Second
+	gcDelay = time.Duration(getEnvInt("GC_DELAY_SECONDS", 60)) * time.Second
 
 	role = getEnv("CN_ROLE", "primary")
 	if role != "primary" && role != "standby" {
@@ -1509,6 +1541,14 @@ func main() {
 	mux.HandleFunc("/files/put/init", requirePrimary(withMethod("POST", replicated(handlePutInit))))
 	mux.HandleFunc("/files/put/complete", requirePrimary(withMethod("POST", replicated(handlePutComplete))))
 	mux.HandleFunc("/files/get", requirePrimary(withMethod("GET", handleGetFile)))
+	// RF3: acceso a archivos (ver acceso.go)
+	mux.HandleFunc("/files/open", requirePrimary(withMethod("POST", replicated(handleOpen))))
+	mux.HandleFunc("/files/lock", requirePrimary(withMethod("POST", replicated(handleLock))))
+	mux.HandleFunc("/files/unlock", requirePrimary(withMethod("POST", replicated(handleUnlock))))
+	mux.HandleFunc("/files/renew", requirePrimary(withMethod("POST", handleRenew)))
+	mux.HandleFunc("/files/write/alloc", requirePrimary(withMethod("POST", replicated(handleWriteAlloc))))
+	mux.HandleFunc("/files/flush", requirePrimary(withMethod("POST", replicated(handleFlushOrClose(false)))))
+	mux.HandleFunc("/files/close", requirePrimary(withMethod("POST", replicated(handleFlushOrClose(true)))))
 	mux.HandleFunc("/datanodes/register", requireClusterSecret(requirePrimary(withMethod("POST", replicated(handleDatanodeRegister)))))
 	mux.HandleFunc("/datanodes/heartbeat", requireClusterSecret(requirePrimary(withMethod("POST", handleHeartbeat))))
 	mux.HandleFunc("/datanodes/status", withMethod("GET", handleDatanodesStatus))
