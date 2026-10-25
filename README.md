@@ -98,6 +98,15 @@ bash pruebas/prueba_rf3.sh     # open/read/write/lock, concurrencia, lease, fail
 bash pruebas/prueba_rebalanceo.sh  # agregar un DataNode y un nodo que vuelve tras caer (8)
 ```
 
+**Mediciones de rendimiento** (Windows, Linux o macOS; contra cualquier clúster, incluido AWS):
+```bash
+python pruebas/medir.py             # batería completa (~15-20 min por Internet)
+python pruebas/medir.py --rapido    # versión corta
+python pruebas/medir.py failover    # tiempo sin servicio al caer el ControlNode primario
+```
+Mide la latencia de metadatos, `put`/`get` según tamaño y paralelismo, la lectura
+parcial (RF3) y los lectores concurrentes. Guarda tablas en `pruebas/resultados/` (`.md` y `.csv`).
+
 ## Cómo ejecutar (Docker Compose, todo en una máquina)
 
 ```bash
