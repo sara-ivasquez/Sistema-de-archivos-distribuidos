@@ -2,18 +2,31 @@ syntax = "proto3";
 
 package dfsha;
 
-// Servicio expuesto por cada DataNode. El Cliente lo usa para escribir y leer
-// bloques directamente (sin pasar por el ControlNode). Tambien se usa entre
-// DataNodes para copiar bloques cuando se necesita re-replicar (Hito 3).
+// Contrato de la API de bloques que expone cada DataNode (DN_PORT).
+//
+// Este archivo es la especificacion formal de referencia. La
+// implementacion real usa un framing binario propio sobre TCP + TLS con
+// los mismos mensajes y semantica (ver common/blockproto.py y
+// datanode_go/main.go). Cada RPC corresponde a un opcode:
+//   PutBlock=1, GetBlock=2, DeleteBlock=3, ReplicateBlock=4, PutRawBlock=5
 service BlockService {
-  // Sube un bloque en streaming (permite bloques grandes sin cargar todo en memoria).
+  // Cliente -> DataNode: escribe un bloque (se guarda cifrado en reposo).
   rpc PutBlock(stream BlockChunk) returns (BlockAck);
 
-  // Descarga un bloque en streaming.
+  // Cliente -> DataNode: lee un bloque.
   rpc GetBlock(BlockRequest) returns (stream BlockChunk);
 
-  // Elimina un bloque local (usado por rm y por el rebalanceo).
-  rpc DeleteBlock(BlockRequest) returns (DeleteAck);
+  // ControlNode -> DataNode: borra un bloque (rm, subida abandonada).
+  // Requiere el secreto del cluster.
+  rpc DeleteBlock(AdminBlockRequest) returns (BlockAck);
+
+  // ControlNode -> DataNode: copia un bloque propio hacia otro DataNode
+  // (re-replicacion automatica). Requiere el secreto del cluster.
+  rpc ReplicateBlock(ReplicateRequest) returns (BlockAck);
+
+  // DataNode -> DataNode: recibe la copia enviada por ReplicateBlock (los
+  // bytes viajan ya cifrados). Requiere el secreto del cluster.
+  rpc PutRawBlock(stream RawBlockChunk) returns (BlockAck);
 }
 
 message BlockChunk {
@@ -21,16 +34,29 @@ message BlockChunk {
   bytes data = 2;
 }
 
-message BlockAck {
-  bool success = 1;
-  string block_id = 2;
-  string message = 3;
-}
-
 message BlockRequest {
   string block_id = 1;
 }
 
-message DeleteAck {
+message AdminBlockRequest {
+  string block_id = 1;
+  string cluster_secret = 2;
+}
+
+message ReplicateRequest {
+  string block_id = 1;
+  string cluster_secret = 2;
+  string target_host = 3;
+  uint32 target_port = 4;
+}
+
+message RawBlockChunk {
+  string block_id = 1;
+  string cluster_secret = 2;
+  bytes encrypted_data = 3;
+}
+
+message BlockAck {
   bool success = 1;
+  string message = 2;
 }
