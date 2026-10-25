@@ -113,3 +113,10 @@ En Windows (PowerShell): `$env:DFSHA_CONTROLNODE_URL="https://IP_CN1:5000,https:
    STANDBY" y el estado sigue intacto.
 7. **Seguridad**: login de un segundo usuario que no ve los archivos del
    primero. Mostrar un bloque en el disco del DataNode (está cifrado).
+8. **RF3 y concurrencia**: abrir dos terminales con `python client/cli.py shell`.
+   - En la primera: `open /notas.txt rw create` → `write 3 hola`. Aún no hagas `close`.
+   - En la segunda: `open /notas.txt rw` → "bloqueado por otro proceso".
+   - En la segunda: `open /notas.txt r` → `lock 3 shared` → también bloqueado.
+   - En la primera: `close 3`. En la segunda, `lock 3 shared` ahora sí funciona.
+   - Para mostrar la lectura parcial: `cat /archivo_grande --offset 5000000 --length 100`.
+     Los logs de los DataNodes muestran que solo se pidió un bloque.
