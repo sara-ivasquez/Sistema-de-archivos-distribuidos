@@ -33,3 +33,12 @@ docker/aws/.env
 
 # Estado persistido del ControlNode en ejecucion local
 controlnode_go/controlnode_state.json*
+
+# Archivos de prueba del cliente (subidas/descargas locales)
+*.bin
+copia*.md
+.dfsha_session.json
+
+# Resultados con nombre automatico de pruebas/medir.py (se guardan a mano
+# con nombre descriptivo, p. ej. pruebas/resultados/aws_bateria_FECHA.md)
+pruebas/resultados/mediciones_*
