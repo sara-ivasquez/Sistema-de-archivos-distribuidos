@@ -1,2 +1,0 @@
-prueba,controlnode_inicial,controlnode_final,segundos_sin_servicio,relogin
-failover,https://100.60.35.182:5000,https://34.196.176.71:5000,9.2,no requerido

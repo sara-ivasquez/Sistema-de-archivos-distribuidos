@@ -29,6 +29,77 @@ pruebas/          Pruebas end-to-end: prueba_local.sh (failover, caídas,
                   prueba_rebalanceo.sh
 ```
 
+## Diagramas
+
+**Arquitectura** (los 5 canales de comunicación; todos cifrados con TLS):
+
+```mermaid
+flowchart TB
+    C["Cliente<br/>CLI + SDK (Python)"]
+    subgraph CN["ControlNodes (Go): metadatos"]
+        direction LR
+        CN1["ControlNode 1<br/>primario"]
+        CN2["ControlNode 2<br/>standby"]
+        CN1 <-- "3. sync + health<br/>(estado y época)" --> CN2
+    end
+    subgraph DN["DataNodes (Go): bloques cifrados AES-256-GCM"]
+        direction LR
+        D1["DataNode 1"]
+        D2["DataNode 2"]
+        D3["DataNode 3"]
+        D1 -- "5. PUT_RAW<br/>re-replicación P2P" --> D2
+    end
+    C -- "1. REST/HTTPS: login, ls, put/init, get, open, lock" --> CN
+    C == "2. API de bloques TCP+TLS: PUT / GET (directo, sin pasar por el ControlNode)" ==> DN
+    DN -- "4. registro + heartbeat (HTTPS)" --> CN
+    CN -- "4. DELETE / REPLICATE (TLS + secreto)" --> DN
+```
+
+**Escritura de un archivo (`put`)**: el ControlNode solo decide dónde va
+cada bloque; los bytes van directo del cliente a los DataNodes.
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant P as ControlNode primario
+    participant S as ControlNode standby
+    participant D1 as DataNode A
+    participant D2 as DataNode B
+    C->>P: POST /files/put/init (ruta, tamaño)
+    P->>P: divide en bloques y elige 2 DataNodes por bloque
+    P-->>C: bloques + réplicas + quórum
+    par por cada bloque (en paralelo)
+        C->>D1: PUT bloque (TLS)
+        D1-->>C: ok (guardado cifrado)
+        C->>D2: PUT bloque (TLS)
+        D2-->>C: ok
+    end
+    Note over C: si un bloque no alcanza el quórum, se aborta
+    C->>P: POST /files/put/complete (checksums SHA-256)
+    P->>S: /internal/sync (estado + época), antes de responder
+    P-->>C: ok
+```
+
+**Failover del ControlNode**:
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant P as ControlNode 1 (primario, época 1)
+    participant S as ControlNode 2 (standby)
+    S->>P: GET /internal/health cada 3 s
+    Note over P: se cae
+    S--xP: 3 health-checks fallidos (~9 s)
+    S->>S: se promueve a primario (época 2)
+    C--xP: petición falla
+    C->>S: reintenta en el siguiente ControlNode (mismo token)
+    S-->>C: responde (sesión replicada, sin re-login)
+    Note over P: revive con época 1
+    P->>S: GET /internal/health -> primario, época 2
+    P->>P: arranca como STANDBY (no hay split-brain)
+    S->>P: /internal/sync (le envía el estado actual)
+```
+
 ## Cómo cumple cada requisito
 
 | Requisito | Implementación |
