@@ -334,6 +334,25 @@ a tiempo y el cliente abortó la subida en lugar de dejar el archivo con menos
 copias (quórum de escritura). Eso llevó a ajustar los plazos de transferencia
 para Internet (`DFSHA_MIN_RATE_KBPS`, `DFSHA_RETRIES`).
 
+**Mediciones** con `pruebas/medir.py` (mismo escenario; datos completos en
+[`pruebas/resultados/`](pruebas/resultados/)):
+
+| Prueba | Resultado |
+|---|---|
+| Integridad | 19 transferencias de 1 a 100 MB, todas con SHA-256 idéntico al original |
+| Paralelismo en `put` (50 MB) | 0,49 MB/s con 1 hilo → **1,25 MB/s con 4 hilos** (×2,5); con 8 hilos ya no mejora (1,16 MB/s): se satura el enlace del cliente |
+| Lectura parcial RF3 | 64 bytes de un archivo de 100 MB en **12,8 s** frente a 284,5 s del `get` completo (**22× menos**); 5/5 lecturas correctas |
+| Failover del ControlNode | **9,2 s** sin servicio hasta que el standby asume (3 health-checks × 3 s); el cliente continúa **sin volver a hacer login** |
+| Metadatos (`ls`, `login`) | ~0,5 s y ~0,6 s por operación: dominado por la latencia de Internet y el handshake TLS; `login` además aplica 100 000 iteraciones de hash a la contraseña |
+| Lectores concurrentes (20 MB) | 1, 2 y 4 clientes: 0,53 / 0,47 / 0,41 MB/s agregados, todos íntegros |
+
+En la descarga y con varios clientes, el throughput agregado no crece porque
+todos los clientes comparten el mismo enlace doméstico: ese enlace es el
+cuello de botella, no los DataNodes. La lectura parcial tarda más que un
+simple acceso a metadatos porque su granularidad es el bloque (4 MB): con
+bloques más pequeños sería más rápida, a cambio de más metadatos en el
+ControlNode.
+
 ## Trabajo futuro
 
 - Control de acceso por **grupos** y archivos compartidos entre usuarios (ACL).
