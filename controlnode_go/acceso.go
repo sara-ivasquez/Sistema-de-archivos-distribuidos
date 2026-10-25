@@ -496,5 +496,5 @@ func expireHandlesAndGC() []Block {
 		}
 	}
 	garbage = kept
-	return out
+	return safeGarbage(out) // nunca borrar una copia que un archivo aun usa
 }

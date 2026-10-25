@@ -29,6 +29,7 @@
 //	TOKEN_TTL_HOURS (default 8), UPLOAD_TIMEOUT_MINUTES (default 30)
 //	CN_STATE_FILE (default ./controlnode_state.json)
 //	HANDLE_TTL_SECONDS (default 60), GC_DELAY_SECONDS (default 60)  [RF3]
+//	REBALANCE_ENABLED (default true), REBALANCE_MAX_MOVES (default 16)
 package main
 
 import (
@@ -1076,10 +1077,16 @@ func reReplicationLoop() {
 				continue
 			}
 			mu.Lock()
-			if entry, ok := fsTree[f.path]; ok && f.blockIndex < len(entry.Blocks) {
+			if entry, ok := fsTree[f.path]; ok && f.blockIndex < len(entry.Blocks) &&
+				entry.Blocks[f.blockIndex].BlockID == f.blockID {
 				entry.Blocks[f.blockIndex].Replicas = append(entry.Blocks[f.blockIndex].Replicas, f.target)
 			}
 			mu.Unlock()
+		}
+
+		// Con todos los bloques completos, se equilibra la carga (ver rebalanceo.go).
+		if len(fixes) == 0 {
+			rebalanceRound()
 		}
 	}
 }
@@ -1513,6 +1520,8 @@ func main() {
 	stateFile = getEnv("CN_STATE_FILE", "./controlnode_state.json")
 	handleTTL = time.Duration(getEnvInt("HANDLE_TTL_SECONDS", 60)) * time.Second
 	gcDelay = time.Duration(getEnvInt("GC_DELAY_SECONDS", 60)) * time.Second
+	rebalanceEnabled = getEnv("REBALANCE_ENABLED", "true") != "false"
+	rebalanceMaxMoves = getEnvInt("REBALANCE_MAX_MOVES", 16)
 
 	role = getEnv("CN_ROLE", "primary")
 	if role != "primary" && role != "standby" {
