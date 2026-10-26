@@ -411,7 +411,7 @@ para Internet (`DFSHA_MIN_RATE_KBPS`, `DFSHA_RETRIES`).
 | Prueba | Resultado |
 |---|---|
 | Integridad | 15 descargas verificadas (archivos de 1 a 100 MB, 1 a 4 clientes), todas con SHA-256 idéntico al original |
-| Paralelismo en `put` (50 MB) | 0,49 MB/s con 1 hilo → **1,25 MB/s con 4 hilos** (×2,5); con 8 hilos ya no mejora (1,16 MB/s): se satura el enlace del cliente |
+| Paralelismo en `put` (50 MB) | 0,49 MB/s con 1 hilo → **1,25 MB/s con 4 hilos** (×2,6); con 8 hilos ya no mejora (1,16 MB/s): se satura el enlace del cliente |
 | Lectura parcial RF3 | 64 bytes de un archivo de 100 MB en **12,8 s** frente a 284,5 s del `get` completo (**22× menos**); 5/5 lecturas correctas |
 | Failover del ControlNode | **9,2 s** sin servicio hasta que el standby asume (3 health-checks × 3 s); el cliente continúa **sin volver a hacer login** |
 | Metadatos (`ls`, `login`) | ~0,5 s y ~0,6 s por operación: dominado por la latencia de Internet y el handshake TLS; `login` además aplica 100 000 iteraciones de hash a la contraseña |
