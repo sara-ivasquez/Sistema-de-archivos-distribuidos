@@ -424,10 +424,4 @@ simple acceso a metadatos porque su granularidad es el bloque (4 MB): con
 bloques más pequeños sería más rápida, a cambio de más metadatos en el
 ControlNode.
 
-## Trabajo futuro
 
-- Control de acceso por **grupos** y archivos compartidos entre usuarios (ACL).
-- Autenticación adicional: **API Keys** y **2FA** (TOTP).
-- Migrar la API de bloques del framing binario propio a **gRPC** real
-  (el contrato ya está definido en `proto/block_service.proto`).
-- Más de dos ControlNodes con consenso (p. ej. Raft) en lugar de primario/standby.
